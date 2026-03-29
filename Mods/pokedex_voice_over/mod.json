@@ -1,0 +1,31 @@
+{
+  "name": "Pokédex Voice Over",
+  "id": "pokedex_voice_over",
+  "version": "1.0.0",
+  "author": "SilvertongueRED",
+  "description": "Reads Pokédex entries aloud in the style of Dexter, the classic Pokémon anime Pokédex narrator, whenever you open a Pokémon's Pokédex entry — including all fused variants.",
+  "tags": ["Audio", "QoL", "Fusion"],
+  "scripts": ["main.rb"],
+  "settings": [
+    {
+      "key": "enabled",
+      "label": "Enable Voice Over",
+      "type": "bool",
+      "default": true
+    },
+    {
+      "key": "volume",
+      "label": "Voice Volume",
+      "type": "int",
+      "default": 80,
+      "min": 0,
+      "max": 100
+    },
+    {
+      "key": "play_on_page_change",
+      "label": "Re-read on Page Return",
+      "type": "bool",
+      "default": false
+    }
+  ]
+}
