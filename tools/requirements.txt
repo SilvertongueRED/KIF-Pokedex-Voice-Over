@@ -1,0 +1,27 @@
+# Pokédex Voice-Over Generator — Python dependencies
+#
+# Install with:
+#   pip install -r requirements.txt
+#
+# ffmpeg must also be installed and on your PATH for pydub to export OGG files.
+# Download from: https://ffmpeg.org/download.html
+
+# --------------------------------------------------------------------------
+# TTS backends (install at least one)
+# --------------------------------------------------------------------------
+
+# Offline TTS — uses the OS built-in voices (SAPI on Windows, NSSpeechSynthesizer
+# on macOS, eSpeak on Linux).  Recommended for the best Dexter-like quality.
+pyttsx3>=2.90
+
+# Online TTS — calls Google's Text-to-Speech API.  Requires internet access.
+# Install as an alternative if pyttsx3 voices are unavailable on your system.
+gTTS>=2.3.2
+
+# --------------------------------------------------------------------------
+# Audio processing (required for Dexter voice effects)
+# --------------------------------------------------------------------------
+
+# Audio manipulation library — applies the band-pass filter and echo overlay
+# that give the voice the classic Pokédex Dexter quality.
+pydub>=0.25.1
