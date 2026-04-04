@@ -81,11 +81,14 @@ python tools/generate_voices.py --game-dir /path/to/KIF --overwrite
 # Generate for a single Pokémon
 python tools/generate_voices.py --game-dir /path/to/KIF --species BULBASAUR
 
-# Also generate fusion-specific entries (if your KIF build has them in PBS)
+# Also generate fusion-specific entries (reads Data/pokedex/dex.json in KIF)
 python tools/generate_voices.py --game-dir /path/to/KIF --fusions
 
 # Use Google TTS instead of offline pyttsx3
 python tools/generate_voices.py --game-dir /path/to/KIF --backend gtts
+
+# Explicitly point to a PBS file (for non-standard installations)
+python tools/generate_voices.py --game-dir /path/to/KIF --pbs-file /path/to/pokemon.txt
 
 # List available pyttsx3 voices (to pick the most Dexter-like one)
 python tools/generate_voices.py --list-voices
@@ -126,6 +129,24 @@ Pokédex Voice Over → Settings**.
 
 ---
 
+## Where Pokédex Data Comes From
+
+The generator script automatically detects and reads Pokédex data from your
+game installation:
+
+1. **`Data/species.dat`** (KIF — preferred) — The compiled species database
+   that ships with every KIF installation.  Requires the `rubymarshal`
+   Python package (installed automatically by `pip install -r requirements.txt`).
+2. **`PBS/pokemon.txt`** (vanilla PIF fallback) — The plain-text PBS file
+   used by original Pokémon Infinite Fusion builds.  If your installation
+   has a `PBS/` folder, the script will use it when `species.dat` is not
+   available.
+
+If neither file is found, use `--pbs-file` to point the script at a PBS
+file manually.
+
+---
+
 ## Fused Pokémon Support
 
 The mod hooks into the same Pokédex scene that displays fused entries.  When
@@ -134,7 +155,12 @@ file is found, the mod falls back to silence (it does **not** play the head
 or body species voice instead, to avoid confusing entries).
 
 To generate fusion audio you need KIF builds that store fusion Pokédex
-descriptions in one of the following PBS files:
+descriptions.  The script checks two sources:
+
+1. **`Data/pokedex/dex.json`** (KIF) — Community-contributed fusion entries
+   included with KIF.  The script uses `Data/species.dat` to map sprite IDs
+   to species names automatically.
+2. **PBS fusion files** (vanilla PIF fallback):
 
 ```
 PBS/fusions.txt
@@ -167,6 +193,7 @@ TTS audio is saved without effects.
 | Symptom | Fix |
 |---|---|
 | No voice plays | Check that `.ogg` files are in `Mods/pokedex_voice_over/Audio/` |
+| `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically. |
 | `ffmpeg not found` error | Install ffmpeg and add it to your PATH |
 | pyttsx3 voices sound wrong | Try `--voice 1` (or another index shown by `--list-voices`) |
 | gTTS fails | Check your internet connection |
