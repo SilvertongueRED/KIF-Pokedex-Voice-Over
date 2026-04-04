@@ -36,6 +36,9 @@ Usage
   # Use Google TTS instead of the default offline pyttsx3 backend
   python generate_voices.py --game-dir /path/to/KIF --backend gtts
 
+  # Explicitly point to a PBS file (for non-standard installations)
+  python generate_voices.py --game-dir /path/to/KIF --pbs-file /path/to/pokemon.txt
+
   # List available pyttsx3 voices and exit (useful for --voice selection)
   python generate_voices.py --list-voices
 
@@ -51,6 +54,7 @@ Requirements
 """
 
 import argparse
+import json
 import logging
 import os
 import re
@@ -81,6 +85,13 @@ try:
     HAS_PYDUB = True
 except ImportError:
     HAS_PYDUB = False
+
+try:
+    import rubymarshal.reader as _rmreader
+    from rubymarshal.classes import RubyObject as _RubyObject
+    HAS_RUBYMARSHAL = True
+except ImportError:
+    HAS_RUBYMARSHAL = False
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -226,6 +237,166 @@ def parse_fusion_entries(game_dir: Path) -> dict:
             if entry_text:
                 fusion_entries[(species1, species2)] = entry_text
 
+    return fusion_entries
+
+
+# ---------------------------------------------------------------------------
+# KIF Data/ parsing (species.dat + JSON Pokédex files)
+# ---------------------------------------------------------------------------
+
+def _ruby_symbol_str(sym) -> str:
+    """Convert a rubymarshal Symbol to a plain uppercase string."""
+    if hasattr(sym, "name"):
+        return sym.name.upper()
+    return str(sym).lstrip(":").upper()
+
+
+def _ruby_bytes_str(val) -> str:
+    """Decode a rubymarshal bytes/string value to a Python str."""
+    if isinstance(val, bytes):
+        return val.decode("utf-8", errors="replace")
+    return str(val) if val else ""
+
+
+def parse_species_dat(species_dat: Path) -> dict:
+    """
+    Parse a KIF/Essentials ``Data/species.dat`` file and return a
+    ``{SPECIES_NAME: entry_text}`` dict.
+
+    Requires the ``rubymarshal`` package (``pip install rubymarshal``).
+    Returns an empty dict if the file cannot be read or rubymarshal is not
+    installed.
+    """
+    entries: dict = {}
+
+    if not HAS_RUBYMARSHAL:
+        log.debug("rubymarshal not installed — cannot parse species.dat")
+        return entries
+
+    if not species_dat.is_file():
+        log.debug("species.dat not found: %s", species_dat)
+        return entries
+
+    try:
+        with open(species_dat, "rb") as fh:
+            data = _rmreader.load(fh)
+    except Exception as exc:
+        log.warning("Failed to parse %s: %s", species_dat, exc)
+        return entries
+
+    for key, obj in data.items():
+        # species.dat is keyed by both integer and Symbol; skip duplicates
+        if isinstance(key, int):
+            continue
+        if not isinstance(obj, _RubyObject):
+            continue
+
+        attrs = obj.attributes
+        form = attrs.get("@form", 0)
+        if form != 0:
+            continue  # skip alternate forms
+
+        species_id = attrs.get("@id")
+        if species_id is None:
+            continue
+        species_name = _ruby_symbol_str(species_id)
+
+        raw_entry = attrs.get("@real_pokedex_entry", "")
+        entry_text = _clean_entry_text(_ruby_bytes_str(raw_entry))
+        if entry_text:
+            entries[species_name] = entry_text
+
+    log.info("Parsed %d Pokédex entries from %s", len(entries), species_dat.name)
+    return entries
+
+
+def build_species_id_map(species_dat: Path) -> dict:
+    """
+    Parse ``Data/species.dat`` and return a ``{dex_number: SPECIES_NAME}``
+    mapping.  Used to resolve numeric IDs in KIF's JSON Pokédex files.
+    """
+    id_map: dict = {}
+
+    if not HAS_RUBYMARSHAL or not species_dat.is_file():
+        return id_map
+
+    try:
+        with open(species_dat, "rb") as fh:
+            data = _rmreader.load(fh)
+    except Exception:
+        return id_map
+
+    for key, obj in data.items():
+        if not isinstance(key, int):
+            continue
+        if not isinstance(obj, _RubyObject):
+            continue
+        attrs = obj.attributes
+        if attrs.get("@form", 0) != 0:
+            continue
+        species_id = attrs.get("@id")
+        if species_id is None:
+            continue
+        id_map[key] = _ruby_symbol_str(species_id)
+
+    return id_map
+
+
+def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> dict:
+    """
+    Parse KIF's ``Data/pokedex/dex.json`` and return a
+    ``{(SPECIES1, SPECIES2): entry_text}`` dict for fusion Pokémon.
+
+    *id_map* must be a ``{dex_number: SPECIES_NAME}`` mapping (from
+    :func:`build_species_id_map`).
+    """
+    fusion_entries: dict = {}
+    dex_json = game_dir / "Data" / "pokedex" / "dex.json"
+
+    if not dex_json.is_file():
+        return fusion_entries
+
+    try:
+        content = dex_json.read_text(encoding="utf-8", errors="replace")
+        records = json.loads(content)
+    except (OSError, json.JSONDecodeError) as exc:
+        log.warning("Cannot read %s: %s", dex_json, exc)
+        return fusion_entries
+
+    for rec in records:
+        sprite = rec.get("sprite", "")
+        entry_text = _clean_entry_text(rec.get("entry", ""))
+        if not entry_text or not sprite:
+            continue
+
+        # Sprite format: "head.body.png" or "head.body_variant.png"
+        base = sprite.rsplit(".png", 1)[0] if sprite.endswith(".png") else sprite
+        parts = base.split(".", 1)
+        if len(parts) != 2:
+            continue
+
+        try:
+            head_id = int(parts[0])
+            # Body may contain variant suffix like "4a"; strip non-digits
+            body_num = re.match(r"(\d+)", parts[1])
+            if not body_num:
+                continue
+            body_id = int(body_num.group(1))
+        except ValueError:
+            continue
+
+        head_name = id_map.get(head_id)
+        body_name = id_map.get(body_id)
+        if not head_name or not body_name:
+            continue
+
+        pair = (head_name, body_name)
+        # Keep the first entry for each pair (skip duplicates)
+        if pair not in fusion_entries:
+            fusion_entries[pair] = entry_text
+
+    if fusion_entries:
+        log.info("Parsed %d fusion entries from %s", len(fusion_entries), dex_json.name)
     return fusion_entries
 
 
@@ -376,7 +547,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--game-dir",
         metavar="PATH",
-        help="Path to your KIF game root directory (contains PBS/, Mods/, etc.).",
+        help="Path to your KIF game root directory (contains Data/, Mods/, etc.).",
+    )
+    p.add_argument(
+        "--pbs-file",
+        metavar="PATH",
+        help=(
+            "Explicit path to a PBS pokemon.txt file.  "
+            "Use this if your game stores PBS data in a non-standard location."
+        ),
     )
     p.add_argument(
         "--species",
@@ -461,16 +640,53 @@ def main(argv=None) -> int:
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info("Output directory: %s", output_dir)
 
-    # ---- parse PBS ----------------------------------------------------------
-    pbs_file = game_dir / "PBS" / "pokemon.txt"
-    all_entries = parse_pbs_pokemon(pbs_file)
+    # ---- parse Pokédex data -------------------------------------------------
+    # Strategy: try Data/species.dat (KIF) first, then PBS/pokemon.txt (PIF),
+    # then an explicit --pbs-file if given.
+    all_entries: dict = {}
+    species_id_map: dict = {}
+    species_dat = game_dir / "Data" / "species.dat"
 
+    # 1. KIF Data/species.dat (requires rubymarshal)
+    if species_dat.is_file():
+        if HAS_RUBYMARSHAL:
+            all_entries = parse_species_dat(species_dat)
+            species_id_map = build_species_id_map(species_dat)
+        else:
+            log.info(
+                "Found %s but rubymarshal is not installed.\n"
+                "  Run:  pip install rubymarshal\n"
+                "  to enable reading Pokédex data directly from the KIF game data.",
+                species_dat,
+            )
+
+    # 2. PBS/pokemon.txt (vanilla PIF or manually extracted)
     if not all_entries:
-        log.error(
-            "No Pokédex entries found.  "
-            "Make sure --game-dir points to the KIF game root "
-            "(the folder that contains the PBS/ directory)."
-        )
+        pbs_file = Path(args.pbs_file) if args.pbs_file else game_dir / "PBS" / "pokemon.txt"
+        if pbs_file.is_file():
+            all_entries = parse_pbs_pokemon(pbs_file)
+
+    # 3. Give up with a helpful error
+    if not all_entries:
+        has_species_dat = species_dat.is_file()
+        if has_species_dat and not HAS_RUBYMARSHAL:
+            log.error(
+                "No Pokédex entries found.\n"
+                "  Your game has Data/species.dat but rubymarshal is not installed.\n"
+                "  Fix:  pip install rubymarshal"
+            )
+        else:
+            log.error(
+                "No Pokédex entries found.\n"
+                "  Make sure --game-dir points to the KIF game root directory\n"
+                "  (the folder that contains Game.exe and the Data/ directory).\n"
+                "  Checked:\n"
+                "    - %s  (not found)\n"
+                "    - %s  (not found)\n"
+                "  If your PBS file is elsewhere, use --pbs-file to specify its path.",
+                species_dat,
+                game_dir / "PBS" / "pokemon.txt",
+            )
         return 1
 
     # ---- filter to single species if requested ------------------------------
@@ -508,12 +724,21 @@ def main(argv=None) -> int:
 
     # ---- process fusion entries (optional) ----------------------------------
     if args.fusions:
-        fusion_entries = parse_fusion_entries(game_dir)
+        fusion_entries: dict = {}
+
+        # Try KIF JSON fusion data first
+        if species_id_map:
+            fusion_entries = parse_kif_fusion_json(game_dir, species_id_map)
+
+        # Fall back to PBS fusion files
+        if not fusion_entries:
+            fusion_entries = parse_fusion_entries(game_dir)
+
         if not fusion_entries:
             log.info(
                 "No fusion Pokédex entries found.  "
                 "KIF may use auto-generated fusion descriptions that are not "
-                "stored in PBS files."
+                "stored in data files."
             )
         for (sp1, sp2), entry_text in sorted(fusion_entries.items()):
             dest = output_dir / f"dex_{sp1}_{sp2}.ogg"

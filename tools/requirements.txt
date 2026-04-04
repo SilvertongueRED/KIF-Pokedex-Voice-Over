@@ -23,5 +23,13 @@ gTTS>=2.3.2
 # --------------------------------------------------------------------------
 
 # Audio manipulation library — applies the band-pass filter and echo overlay
-# that give the voice the classic Pokédex Dexter quality.
+# that give the voice the classic Pokédex Dexter voice quality.
 pydub>=0.25.1
+
+# --------------------------------------------------------------------------
+# KIF game data parsing (required for reading Data/species.dat)
+# --------------------------------------------------------------------------
+
+# Ruby Marshal reader — allows the script to read Pokédex entries directly
+# from the game's compiled species.dat file (no PBS folder needed).
+rubymarshal>=1.2.7
