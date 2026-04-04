@@ -61,6 +61,7 @@ import re
 import shutil
 import sys
 import tempfile
+import warnings
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -80,11 +81,19 @@ except ImportError:
     HAS_GTTS = False
 
 try:
-    from pydub import AudioSegment
-    from pydub.effects import normalize
+    # Suppress pydub's own RuntimeWarning about ffmpeg not being found at
+    # import time — we perform our own explicit check below (HAS_FFMPEG).
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", RuntimeWarning)
+        from pydub import AudioSegment
+        from pydub.effects import normalize
     HAS_PYDUB = True
 except ImportError:
     HAS_PYDUB = False
+
+# pydub requires ffmpeg (or avconv) to be on PATH for audio format conversion.
+# Check once here so we can warn the user upfront instead of erroring per file.
+HAS_FFMPEG = HAS_PYDUB and bool(shutil.which("ffmpeg") or shutil.which("avconv"))
 
 try:
     from rubymarshal.reader import load as _rubymarshal_load
@@ -492,7 +501,7 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
             return False
 
         # ---- step 2: audio effects + export --------------------------------
-        if HAS_PYDUB:
+        if HAS_PYDUB and HAS_FFMPEG:
             try:
                 audio = AudioSegment.from_file(str(raw_path))
                 audio = _apply_dexter_effect(audio)
@@ -507,13 +516,10 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
                 shutil.copy(str(raw_path), str(dest_ogg.with_suffix(raw_path.suffix)))
                 return True
         else:
-            # No pydub — just save the raw audio (no Dexter effects)
+            # No pydub or no ffmpeg — save the raw audio without Dexter effects.
+            # The user has already been warned at startup; no per-file message needed.
             fallback = dest_ogg.with_suffix(raw_path.suffix)
             shutil.copy(str(raw_path), str(fallback))
-            log.warning(
-                "pydub not installed — saved raw TTS as %s (no Dexter effects).",
-                fallback.name,
-            )
 
     return True
 
@@ -633,8 +639,18 @@ def main(argv=None) -> int:
     if not HAS_PYDUB:
         log.warning(
             "pydub is not installed — Dexter audio effects will be skipped.\n"
-            "Run:  pip install pydub\n"
+            "Run:  pip install -r tools/requirements.txt\n"
             "Also ensure ffmpeg is installed and on your PATH."
+        )
+    elif not HAS_FFMPEG:
+        log.warning(
+            "ffmpeg not found on PATH — Dexter audio effects will be skipped.\n"
+            "Install ffmpeg and add it to your PATH:\n"
+            "  Windows: https://ffmpeg.org/download.html  (add the bin/ folder to PATH)\n"
+            "           or:  winget install ffmpeg  /  choco install ffmpeg\n"
+            "  macOS:   brew install ffmpeg\n"
+            "  Linux:   sudo apt install ffmpeg\n"
+            "After installing, open a new terminal so the updated PATH takes effect."
         )
 
     # ---- resolve output directory -------------------------------------------

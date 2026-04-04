@@ -26,6 +26,10 @@ gTTS>=2.3.2
 # that give the voice the classic Pokédex Dexter voice quality.
 pydub>=0.25.1
 
+# audioop was removed from the Python standard library in Python 3.13 (PEP 594).
+# pydub depends on it internally, so this LTS back-port is required on 3.13+.
+audioop-lts; python_version>="3.13"
+
 # --------------------------------------------------------------------------
 # KIF game data parsing (required for reading Data/species.dat)
 # --------------------------------------------------------------------------
