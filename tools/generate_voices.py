@@ -87,8 +87,8 @@ except ImportError:
     HAS_PYDUB = False
 
 try:
-    import rubymarshal.reader as _rmreader
-    from rubymarshal.classes import RubyObject as _RubyObject
+    from rubymarshal.reader import load as _rubymarshal_load
+    from rubymarshal.classes import RubyObject as RubyObject
     HAS_RUBYMARSHAL = True
 except ImportError:
     HAS_RUBYMARSHAL = False
@@ -279,7 +279,7 @@ def parse_species_dat(species_dat: Path) -> dict:
 
     try:
         with open(species_dat, "rb") as fh:
-            data = _rmreader.load(fh)
+            data = _rubymarshal_load(fh)
     except Exception as exc:
         log.warning("Failed to parse %s: %s", species_dat, exc)
         return entries
@@ -288,7 +288,7 @@ def parse_species_dat(species_dat: Path) -> dict:
         # species.dat is keyed by both integer and Symbol; skip duplicates
         if isinstance(key, int):
             continue
-        if not isinstance(obj, _RubyObject):
+        if not isinstance(obj, RubyObject):
             continue
 
         attrs = obj.attributes
@@ -301,6 +301,8 @@ def parse_species_dat(species_dat: Path) -> dict:
             continue
         species_name = _ruby_symbol_str(species_id)
 
+        # "real_" prefix is Pokémon Essentials' convention for translatable
+        # text fields (the non-translated source string).
         raw_entry = attrs.get("@real_pokedex_entry", "")
         entry_text = _clean_entry_text(_ruby_bytes_str(raw_entry))
         if entry_text:
@@ -322,14 +324,14 @@ def build_species_id_map(species_dat: Path) -> dict:
 
     try:
         with open(species_dat, "rb") as fh:
-            data = _rmreader.load(fh)
+            data = _rubymarshal_load(fh)
     except Exception:
         return id_map
 
     for key, obj in data.items():
         if not isinstance(key, int):
             continue
-        if not isinstance(obj, _RubyObject):
+        if not isinstance(obj, RubyObject):
             continue
         attrs = obj.attributes
         if attrs.get("@form", 0) != 0:
@@ -547,7 +549,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--game-dir",
         metavar="PATH",
-        help="Path to your KIF game root directory (contains Data/, Mods/, etc.).",
+        help="Path to your KIF game root directory (contains Data/ and/or PBS/, Mods/, etc.).",
     )
     p.add_argument(
         "--pbs-file",
