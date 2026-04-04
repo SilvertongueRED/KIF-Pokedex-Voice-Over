@@ -26,7 +26,7 @@ including every fused variant.
 | Requirement | Notes |
 |---|---|
 | **Kuray's Infinite Fusion (KIF)** | The Kuray fork with Mod Manager support |
-| **Python 3.8+** | For the audio-generation script only |
+| **Python 3.8+** | For the audio-generation script only; Python 3.13+ is fully supported via `audioop-lts` (installed automatically by `pip install -r tools/requirements.txt`) |
 | **ffmpeg** | Required by pydub to export OGG files — [download here](https://ffmpeg.org/download.html) |
 
 ---
@@ -194,7 +194,9 @@ TTS audio is saved without effects.
 |---|---|
 | No voice plays | Check that `.ogg` files are in `Mods/pokedex_voice_over/Audio/` |
 | `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically. |
-| `ffmpeg not found` error | Install ffmpeg and add it to your PATH |
+| `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
+| `pydub processing failed: [WinError 2]` | ffmpeg is not on PATH (or the terminal was opened before ffmpeg was added to PATH).  Install ffmpeg and restart your terminal, then re-run the script. |
+| `pydub` import fails with `ModuleNotFoundError: No module named 'audioop'` (Python 3.13+) | Run `pip install -r tools/requirements.txt` — this installs `audioop-lts` which replaces the `audioop` module removed in Python 3.13. |
 | pyttsx3 voices sound wrong | Try `--voice 1` (or another index shown by `--list-voices`) |
 | gTTS fails | Check your internet connection |
 | Voice cuts off mid-sentence | Normal for the ME channel — the full file plays but in-game ME events can interrupt it |
