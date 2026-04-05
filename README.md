@@ -173,9 +173,15 @@ game installation:
    used by original Pokémon Infinite Fusion builds.  If your installation
    has a `PBS/` folder, the script will use it when `species.dat` is not
    available.
+3. **`Data/Scripts/990_NPT/001_Registration.rb`** (supplementary) — Ruby
+   script files that register additional Pokémon via
+   `GameData::Species.register({...})` blocks.  The script auto-discovers
+   these under `Data/Scripts/` and merges any species not already found in
+   `species.dat` or PBS.  Use `--registration-file` to point at a specific
+   file if it lives in a non-standard location.
 
-If neither file is found, use `--pbs-file` to point the script at a PBS
-file manually.
+If none of these files are found, use `--pbs-file` or `--registration-file`
+to point the script at your data manually.
 
 ---
 
@@ -244,7 +250,7 @@ TTS audio is saved without effects.
 | `requests` not installed | Run `pip install -r tools/requirements.txt` to install all dependencies including `requests` (needed for `--backend fakeyou`). |
 | No voice plays | Check that `.ogg` files are in `Audio/SE/` (inside your KIF game root) |
 | Some entries failed to generate | Re-run with `--retry-failed` to retry only the failed entries — check `Audio/SE/failed_entries.json` for details |
-| `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically. |
+| `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically.  If your game stores species in a `Registration.rb` script, use `--registration-file /path/to/001_Registration.rb`. |
 | `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
 | `pydub processing failed: [WinError 2]` | ffmpeg is not on PATH (or the terminal was opened before ffmpeg was added to PATH).  Install ffmpeg and restart your terminal, then re-run the script. |
 | `pydub` import fails with `ModuleNotFoundError: No module named 'audioop'` (Python 3.13+) | Run `pip install -r tools/requirements.txt` — this installs `audioop-lts` which replaces the `audioop` module removed in Python 3.13. |
