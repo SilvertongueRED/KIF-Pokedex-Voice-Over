@@ -87,6 +87,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 import warnings
 from pathlib import Path
@@ -677,13 +678,14 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
             # 3. Download the WAV file — try each candidate URL in order
             last_exc: Exception | None = None
             for audio_url in audio_urls:
-                # Only send the session cookie to FakeYou / api.fakeyou.com
-                # domains; skip it for third-party CDNs (e.g. googleapis).
-                use_headers = (
-                    dl_headers
-                    if "fakeyou.com" in audio_url
-                    else {}
+                # Only send the session cookie to FakeYou's own domains;
+                # skip it for third-party CDNs (e.g. googleapis.com).
+                parsed_host = urllib.parse.urlparse(audio_url).hostname or ""
+                is_fakeyou = (
+                    parsed_host == "fakeyou.com"
+                    or parsed_host.endswith(".fakeyou.com")
                 )
+                use_headers = dl_headers if is_fakeyou else {}
                 for attempt in range(1, _FAKEYOU_DOWNLOAD_RETRIES + 1):
                     try:
                         audio_resp = _requests.get(
@@ -703,7 +705,10 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
                                 _FAKEYOU_DOWNLOAD_BACKOFF,
                             )
                             time.sleep(_FAKEYOU_DOWNLOAD_BACKOFF)
-                log.debug("All retries exhausted for URL: %s", audio_url)
+                log.warning(
+                    "All %d download retries exhausted for URL: %s",
+                    _FAKEYOU_DOWNLOAD_RETRIES, audio_url,
+                )
 
             raise RuntimeError(
                 f"Failed to download FakeYou audio from "
