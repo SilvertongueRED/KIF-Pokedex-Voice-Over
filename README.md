@@ -28,6 +28,7 @@ including every fused variant.
 | **Kuray's Infinite Fusion (KIF)** | The Kuray fork with Mod Manager support |
 | **Python 3.8+** | For the audio-generation script only; Python 3.13+ is fully supported via `audioop-lts` (installed automatically by `pip install -r tools/requirements.txt`) |
 | **ffmpeg** | Required by pydub to export OGG files — [download here](https://ffmpeg.org/download.html) |
+| **Internet access** | Required for the recommended `--backend fakeyou` (the real anime Pokédex voice) |
 
 ---
 
@@ -62,35 +63,54 @@ cd tools/
 pip install -r requirements.txt
 ```
 
-> **Windows users:** `pyttsx3` uses the built-in Microsoft SAPI voices (e.g.
-> "Microsoft David Desktop"), which sound naturally robotic — ideal for
-> replicating the Dexter voice.  No extra setup needed.
->
-> **macOS/Linux users:** `pyttsx3` uses the system voice (Alex / eSpeak).
-> You may prefer `--backend gtts` for a slightly cleaner result.
-
 #### 2b. Run the generator
 
-```bash
-# Generate all regular Pokémon entries
-python tools/generate_voices.py --game-dir /path/to/KIF
+**Recommended: Use FakeYou for the real anime Pokédex voice**
 
-# Generate and overwrite any existing files
-python tools/generate_voices.py --game-dir /path/to/KIF --overwrite
+The `--backend fakeyou` option uses the [FakeYou](https://fakeyou.com/) AI
+voice model **"Pokedex (Pokemon, 4Kids)"** — a community-trained model that
+replicates the actual Dexter voice from the original Pokémon anime.  This is
+the same approach used by [adriantwarog/Pokedex-RL](https://github.com/adriantwarog/Pokedex-RL).
+
+```bash
+# Generate all regular Pokémon entries with the real anime voice
+python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou
+
+# With FakeYou priority queue access (set FAKEYOU_COOKIE env var or pass directly)
+python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --fakeyou-cookie YOUR_COOKIE
 
 # Generate for a single Pokémon
-python tools/generate_voices.py --game-dir /path/to/KIF --species BULBASAUR
+python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --species BULBASAUR
 
-# Also generate fusion-specific entries (reads Data/pokedex/dex.json in KIF)
-python tools/generate_voices.py --game-dir /path/to/KIF --fusions
+# Also generate fusion-specific entries
+python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --fusions
 
-# Use Google TTS instead of offline pyttsx3
+# Overwrite any existing files
+python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --overwrite
+```
+
+> **Getting a FakeYou cookie (optional but recommended):** Create a free
+> account at [fakeyou.com](https://fakeyou.com/), log in, then copy the
+> `session` cookie value from your browser's developer tools
+> (Application → Cookies → fakeyou.com → `session`).  This gives you
+> priority queue access for faster generation.  You can set it as an
+> environment variable: `export FAKEYOU_COOKIE=your_cookie_here`
+
+**Alternative: Offline/generic TTS backends**
+
+If you prefer offline generation or do not have internet access, the
+`pyttsx3` and `gTTS` backends are available as fallbacks.  These use generic
+system voices with post-processing effects to approximate the Pokédex sound,
+but they will not match the real anime voice.
+
+```bash
+# Use offline system TTS (pyttsx3 — generic voice with effects)
+python tools/generate_voices.py --game-dir /path/to/KIF
+
+# Use Google TTS (gTTS — generic voice with effects)
 python tools/generate_voices.py --game-dir /path/to/KIF --backend gtts
 
-# Explicitly point to a PBS file (for non-standard installations)
-python tools/generate_voices.py --game-dir /path/to/KIF --pbs-file /path/to/pokemon.txt
-
-# List available pyttsx3 voices (to pick the most Dexter-like one)
+# List available pyttsx3 voices (to pick one)
 python tools/generate_voices.py --list-voices
 python tools/generate_voices.py --game-dir /path/to/KIF --voice 1
 ```
@@ -172,10 +192,24 @@ Run the generator with `--fusions` to process these files.
 
 ---
 
-## How the Dexter Voice Effect Works
+## How the Voice Generation Works
 
-The generator applies three post-processing steps to any TTS voice to
-approximate the classic Pokédex sound:
+### FakeYou backend (recommended — `--backend fakeyou`)
+
+The generator uses the [FakeYou](https://fakeyou.com/) text-to-speech API
+with the community-trained **"Pokedex (Pokemon, 4Kids)"** AI voice model.
+This model was trained on actual Pokédex Dexter voice clips from the 4Kids
+English dub of the Pokémon anime, producing audio that sounds like the real
+thing.  This is the same voice model used by the
+[real-life Pokédex project](https://github.com/adriantwarog/Pokedex-RL).
+
+No post-processing effects are applied — the AI voice model produces the
+authentic Pokédex sound directly.
+
+### pyttsx3 / gTTS backends (offline fallbacks)
+
+When using the generic `pyttsx3` or `gTTS` backends, the generator applies
+three post-processing steps to approximate the Pokédex sound:
 
 1. **High-pass filter (350 Hz)** — removes bass, producing the thin,
    broadcast-radio quality
@@ -192,12 +226,16 @@ TTS audio is saved without effects.
 
 | Symptom | Fix |
 |---|---|
+| Voice doesn't sound like the anime Pokédex | Use `--backend fakeyou` — the default `pyttsx3`/`gTTS` backends use generic voices with effects. FakeYou uses an AI model trained on the real anime voice. |
+| FakeYou job times out | The anonymous queue can be slow. Get a [FakeYou account](https://fakeyou.com/) and pass your session cookie via `--fakeyou-cookie` or the `FAKEYOU_COOKIE` env var for priority access. |
+| FakeYou returns "rate limited" | Wait a few minutes and try again. With a FakeYou cookie you get higher rate limits. For large batches, the script automatically pauses and retries. |
+| `requests` not installed | Run `pip install -r tools/requirements.txt` to install all dependencies including `requests` (needed for `--backend fakeyou`). |
 | No voice plays | Check that `.ogg` files are in `Mods/pokedex_voice_over/Audio/` |
 | `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically. |
 | `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
 | `pydub processing failed: [WinError 2]` | ffmpeg is not on PATH (or the terminal was opened before ffmpeg was added to PATH).  Install ffmpeg and restart your terminal, then re-run the script. |
 | `pydub` import fails with `ModuleNotFoundError: No module named 'audioop'` (Python 3.13+) | Run `pip install -r tools/requirements.txt` — this installs `audioop-lts` which replaces the `audioop` module removed in Python 3.13. |
-| pyttsx3 voices sound wrong | Try `--voice 1` (or another index shown by `--list-voices`) |
+| pyttsx3 voices sound wrong | Try `--voice 1` (or another index shown by `--list-voices`) — or switch to `--backend fakeyou` for the real anime voice |
 | gTTS fails | Check your internet connection |
 | Voice cuts off mid-sentence | Normal for the ME channel — the full file plays but in-game ME events can interrupt it |
 | Mod not loading | Ensure `Mods/pokedex_voice_over/mod.json` and `main.rb` are both present |
