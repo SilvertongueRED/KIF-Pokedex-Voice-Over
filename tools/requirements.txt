@@ -11,12 +11,24 @@
 # --------------------------------------------------------------------------
 
 # Offline TTS — uses the OS built-in voices (SAPI on Windows, NSSpeechSynthesizer
-# on macOS, eSpeak on Linux).  Recommended for the best Dexter-like quality.
+# on macOS, eSpeak on Linux).  A basic fallback; does not replicate the real
+# anime Pokédex voice.
 pyttsx3>=2.90
 
 # Online TTS — calls Google's Text-to-Speech API.  Requires internet access.
 # Install as an alternative if pyttsx3 voices are unavailable on your system.
 gTTS>=2.3.2
+
+# --------------------------------------------------------------------------
+# FakeYou TTS (RECOMMENDED — replicates the real anime Pokédex voice)
+# --------------------------------------------------------------------------
+
+# HTTP library used to call the FakeYou text-to-speech API with the
+# community-trained "Pokedex (Pokemon, 4Kids)" AI voice model.
+# This produces audio that sounds like the actual Dexter Pokédex narrator
+# from the Pokémon anime, matching the voice used by the real-life Pokédex
+# project (github.com/adriantwarog/Pokedex-RL).
+requests>=2.28.0
 
 # --------------------------------------------------------------------------
 # Audio processing (required for Dexter voice effects)
