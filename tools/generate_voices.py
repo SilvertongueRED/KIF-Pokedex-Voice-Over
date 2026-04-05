@@ -482,7 +482,7 @@ _FAKEYOU_AUDIO_BASE = "https://storage.googleapis.com/vocodes-public"
 
 # Polling settings for waiting on FakeYou job completion
 _FAKEYOU_POLL_INTERVAL = 5      # seconds between status checks
-_FAKEYOU_MAX_WAIT = 120         # give up after this many seconds
+_FAKEYOU_MAX_WAIT = 300         # give up after this many seconds (anonymous queue can be slow)
 _FAKEYOU_RATE_LIMIT_WAIT = 15   # pause when rate-limited
 
 
@@ -535,15 +535,20 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
 
     # 2. Poll until the job finishes
     elapsed = 0
+    status = "unknown"
     while elapsed < _FAKEYOU_MAX_WAIT:
         time.sleep(_FAKEYOU_POLL_INTERVAL)
         elapsed += _FAKEYOU_POLL_INTERVAL
 
-        poll_resp = _requests.get(
-            _FAKEYOU_JOB_URL.format(job_token),
-            headers=headers,
-            timeout=30,
-        )
+        try:
+            poll_resp = _requests.get(
+                _FAKEYOU_JOB_URL.format(job_token),
+                headers=headers,
+                timeout=30,
+            )
+        except _requests.RequestException as exc:
+            log.debug("FakeYou poll request failed: %s", exc)
+            continue
         if poll_resp.status_code == 429:
             log.debug("FakeYou rate-limited, waiting %ds…", _FAKEYOU_RATE_LIMIT_WAIT)
             time.sleep(_FAKEYOU_RATE_LIMIT_WAIT)
@@ -551,7 +556,7 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
             continue
         poll_resp.raise_for_status()
         state = poll_resp.json().get("state", {})
-        status = state.get("status", "")
+        status = state.get("status", "unknown")
 
         log.debug("  Job %s status: %s (%.0fs)", job_token, status, elapsed)
 
@@ -562,8 +567,13 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
 
             # 3. Download the WAV file
             audio_url = f"{_FAKEYOU_AUDIO_BASE}{wav_path}"
-            audio_resp = _requests.get(audio_url, timeout=60)
-            audio_resp.raise_for_status()
+            try:
+                audio_resp = _requests.get(audio_url, timeout=60)
+                audio_resp.raise_for_status()
+            except _requests.RequestException as exc:
+                raise RuntimeError(
+                    f"Failed to download FakeYou audio from {audio_url}: {exc}"
+                ) from exc
             out_wav.write_bytes(audio_resp.content)
             log.debug("Downloaded FakeYou audio: %s", out_wav)
             return
