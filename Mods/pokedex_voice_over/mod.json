@@ -10,21 +10,22 @@
     {
       "key": "enabled",
       "label": "Enable Voice Over",
-      "type": "bool",
+      "type": "toggle",
       "default": true
     },
     {
       "key": "volume",
       "label": "Voice Volume",
-      "type": "int",
+      "type": "slider",
       "default": 80,
       "min": 0,
-      "max": 100
+      "max": 100,
+      "step": 1
     },
     {
       "key": "play_on_page_change",
       "label": "Re-read on Page Return",
-      "type": "bool",
+      "type": "toggle",
       "default": false
     }
   ]
