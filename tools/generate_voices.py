@@ -25,7 +25,10 @@ TTS backends
                       with post-processing effects.
 
 Output files are saved as OGG Vorbis to:
-  <game-dir>/Audio/SE/
+  <game-dir>/Audio/SE/Pokedex/
+
+A duration manifest is written alongside the audio files:
+  <game-dir>/Audio/SE/Pokedex/dex_durations.json
 
 Naming convention
 -----------------
@@ -1051,7 +1054,7 @@ def main(argv=None) -> int:
         )
 
     # ---- resolve output directory -------------------------------------------
-    output_dir = game_dir / "Audio" / "SE"
+    output_dir = game_dir / "Audio" / "SE" / "Pokedex"
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info("Output directory: %s", output_dir)
 
@@ -1179,6 +1182,17 @@ def main(argv=None) -> int:
     else:
         pending = _all_pending_entries()
 
+    # ---- load existing duration manifest (for merge on retry) ---------------
+    durations_path = output_dir / "dex_durations.json"
+    durations: dict = {}
+    if durations_path.exists():
+        try:
+            with open(durations_path, encoding="utf-8") as fh:
+                durations = json.load(fh)
+        except Exception as exc:
+            log.warning("Could not read duration manifest %s: %s", durations_path, exc)
+            durations = {}
+
     # ---- process entries ----------------------------------------------------
     generated = skipped = failed = 0
 
@@ -1206,9 +1220,29 @@ def main(argv=None) -> int:
             generated += 1
             # Remove from failure log on success
             failure_log.pop(filename, None)
+            # Record duration in manifest (requires pydub + ffmpeg)
+            if HAS_PYDUB and HAS_FFMPEG and dest.exists():
+                try:
+                    audio = AudioSegment.from_file(str(dest))
+                    durations[filename] = len(audio) / 1000.0
+                except Exception as exc:
+                    log.debug("Could not read duration for %s: %s", filename, exc)
         else:
             failed += 1
             failure_log[filename] = reason
+
+    # ---- persist duration manifest ------------------------------------------
+    if durations:
+        try:
+            with open(durations_path, "w", encoding="utf-8") as fh:
+                json.dump(durations, fh, indent=2, sort_keys=True)
+            log.info(
+                "Duration manifest updated (%d entries): %s",
+                len(durations),
+                durations_path,
+            )
+        except Exception as exc:
+            log.warning("Could not write duration manifest %s: %s", durations_path, exc)
 
     # ---- persist failure log ------------------------------------------------
     try:
