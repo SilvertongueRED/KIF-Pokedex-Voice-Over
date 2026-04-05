@@ -550,7 +550,9 @@ def _fakeyou_login(username: str, password: str) -> str:
             f"{result.get('error_reason', 'unknown error')}"
         )
 
-    # Extract session cookie from the response Set-Cookie header
+    # Extract session cookie from the response Set-Cookie header.
+    # resp.cookies is preferred; the raw header fallback is defensive
+    # in case the requests library's cookie jar misses it.
     session_cookie = resp.cookies.get("session", "")
     if not session_cookie:
         # Try parsing from raw Set-Cookie header as fallback
@@ -816,15 +818,17 @@ def build_arg_parser() -> argparse.ArgumentParser:
         metavar="NAME",
         help="Generate a file for one species only (e.g. BULBASAUR).",
     )
-    p.add_argument(
+    fusions_group = p.add_mutually_exclusive_group()
+    fusions_group.add_argument(
         "--fusions",
         action="store_true",
         default=True,
         help="Generate voice files for fusion Pokédex entries (default: on).",
     )
-    p.add_argument(
+    fusions_group.add_argument(
         "--no-fusions",
-        action="store_true",
+        dest="fusions",
+        action="store_false",
         help="Skip fusion Pokédex entries — generate only regular Pokémon.",
     )
     p.add_argument(
@@ -928,9 +932,6 @@ def main(argv=None) -> int:
         except RuntimeError as exc:
             log.error("FakeYou login failed: %s", exc)
             return 1
-
-    # Resolve --no-fusions override
-    do_fusions = args.fusions and not args.no_fusions
 
     if args.backend == "fakeyou":
         if not HAS_REQUESTS:
@@ -1063,7 +1064,7 @@ def main(argv=None) -> int:
             failed += 1
 
     # ---- process fusion entries ---------------------------------------------
-    if do_fusions:
+    if args.fusions:
         fusion_entries: dict = {}
 
         # Try KIF JSON fusion data first
