@@ -87,6 +87,7 @@ import shutil
 import sys
 import tempfile
 import time
+import urllib.parse
 import uuid
 import warnings
 from pathlib import Path
@@ -483,7 +484,9 @@ _FAKEYOU_MODEL_TOKEN = "weight_dh8zry5bgkfm0z6nv3anqa9y5"
 _FAKEYOU_LOGIN_URL = "https://api.fakeyou.com/v1/login"
 _FAKEYOU_INFERENCE_URL = "https://api.fakeyou.com/tts/inference"
 _FAKEYOU_JOB_URL = "https://api.fakeyou.com/tts/job/{}"
-_FAKEYOU_AUDIO_BASE = "https://storage.googleapis.com/vocodes-public"
+_FAKEYOU_AUDIO_BASE = "https://cdn-2.fakeyou.com"
+# Fallback for environments where the primary CDN is not yet propagated
+_FAKEYOU_AUDIO_BASE_FALLBACK = "https://storage.googleapis.com/vocodes-public"
 
 # Polling settings for waiting on FakeYou job completion
 _FAKEYOU_POLL_INTERVAL = 5      # seconds between status checks
@@ -647,35 +650,69 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
         log.debug("  Job %s status: %s (%.0fs)", job_token, status, elapsed)
 
         if status == "complete_success":
+            # Build candidate download URLs.
+            # Prefer a full result URL returned by the API (future-proof);
+            # fall back to constructing the URL from the audio path and
+            # the known CDN base(s).
+            audio_urls: list[str] = []
+
+            full_url = state.get("maybe_result_url") or state.get("result_url")
+            if full_url:
+                audio_urls.append(full_url)
+
             wav_path = state.get("maybe_public_bucket_wav_audio_path")
-            if not wav_path:
+            if wav_path:
+                audio_urls.append(f"{_FAKEYOU_AUDIO_BASE}{wav_path}")
+                audio_urls.append(f"{_FAKEYOU_AUDIO_BASE_FALLBACK}{wav_path}")
+
+            if not audio_urls:
                 raise RuntimeError("FakeYou job succeeded but returned no audio path")
 
-            # 3. Download the WAV file (with retries and auth cookie)
-            audio_url = f"{_FAKEYOU_AUDIO_BASE}{wav_path}"
+            # Use plain headers for CDN download (no JSON content-type).
+            # Include the session cookie when downloading from FakeYou's
+            # own CDN, but omit it for third-party hosts.
+            dl_headers: dict[str, str] = {}
+            if cookie:
+                dl_headers["Cookie"] = f"session={cookie}"
+
+            # 3. Download the WAV file — try each candidate URL in order
             last_exc: Exception | None = None
-            for attempt in range(1, _FAKEYOU_DOWNLOAD_RETRIES + 1):
-                try:
-                    audio_resp = _requests.get(
-                        audio_url, headers=headers, timeout=60,
-                    )
-                    audio_resp.raise_for_status()
-                    out_wav.write_bytes(audio_resp.content)
-                    log.debug("Downloaded FakeYou audio: %s", out_wav)
-                    return
-                except _requests.RequestException as exc:
-                    last_exc = exc
-                    if attempt < _FAKEYOU_DOWNLOAD_RETRIES:
-                        log.debug(
-                            "FakeYou download attempt %d/%d failed (%s), "
-                            "retrying in %ds…",
-                            attempt, _FAKEYOU_DOWNLOAD_RETRIES, exc,
-                            _FAKEYOU_DOWNLOAD_BACKOFF,
+            for audio_url in audio_urls:
+                # Only send the session cookie to FakeYou's own domains;
+                # skip it for third-party CDNs (e.g. googleapis.com).
+                parsed_host = urllib.parse.urlparse(audio_url).hostname or ""
+                is_fakeyou = (
+                    parsed_host == "fakeyou.com"
+                    or parsed_host.endswith(".fakeyou.com")
+                )
+                use_headers = dl_headers if is_fakeyou else {}
+                for attempt in range(1, _FAKEYOU_DOWNLOAD_RETRIES + 1):
+                    try:
+                        audio_resp = _requests.get(
+                            audio_url, headers=use_headers, timeout=60,
                         )
-                        time.sleep(_FAKEYOU_DOWNLOAD_BACKOFF)
+                        audio_resp.raise_for_status()
+                        out_wav.write_bytes(audio_resp.content)
+                        log.debug("Downloaded FakeYou audio: %s", out_wav)
+                        return
+                    except _requests.RequestException as exc:
+                        last_exc = exc
+                        if attempt < _FAKEYOU_DOWNLOAD_RETRIES:
+                            log.debug(
+                                "FakeYou download attempt %d/%d failed (%s), "
+                                "retrying in %ds…",
+                                attempt, _FAKEYOU_DOWNLOAD_RETRIES, exc,
+                                _FAKEYOU_DOWNLOAD_BACKOFF,
+                            )
+                            time.sleep(_FAKEYOU_DOWNLOAD_BACKOFF)
+                log.warning(
+                    "All %d download retries exhausted for URL: %s",
+                    _FAKEYOU_DOWNLOAD_RETRIES, audio_url,
+                )
+
             raise RuntimeError(
-                f"Failed to download FakeYou audio from {audio_url}: "
-                f"{last_exc}"
+                f"Failed to download FakeYou audio from "
+                f"{audio_urls}: {last_exc}"
             ) from last_exc
 
         if status in ("dead", "attempt_failed", "complete_failure"):
