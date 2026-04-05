@@ -489,6 +489,8 @@ _FAKEYOU_AUDIO_BASE = "https://storage.googleapis.com/vocodes-public"
 _FAKEYOU_POLL_INTERVAL = 5      # seconds between status checks
 _FAKEYOU_MAX_WAIT = 300         # give up after this many seconds (anonymous queue can be slow)
 _FAKEYOU_RATE_LIMIT_WAIT = 15   # pause when rate-limited
+_FAKEYOU_DOWNLOAD_RETRIES = 3   # number of download attempts before giving up
+_FAKEYOU_DOWNLOAD_BACKOFF = 5   # seconds to wait between download retries
 
 
 def _sanitize_fakeyou_cookie(raw: str) -> str:
@@ -649,18 +651,32 @@ def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
             if not wav_path:
                 raise RuntimeError("FakeYou job succeeded but returned no audio path")
 
-            # 3. Download the WAV file
+            # 3. Download the WAV file (with retries and auth cookie)
             audio_url = f"{_FAKEYOU_AUDIO_BASE}{wav_path}"
-            try:
-                audio_resp = _requests.get(audio_url, timeout=60)
-                audio_resp.raise_for_status()
-            except _requests.RequestException as exc:
-                raise RuntimeError(
-                    f"Failed to download FakeYou audio from {audio_url}: {exc}"
-                ) from exc
-            out_wav.write_bytes(audio_resp.content)
-            log.debug("Downloaded FakeYou audio: %s", out_wav)
-            return
+            last_exc: Exception | None = None
+            for attempt in range(1, _FAKEYOU_DOWNLOAD_RETRIES + 1):
+                try:
+                    audio_resp = _requests.get(
+                        audio_url, headers=headers, timeout=60,
+                    )
+                    audio_resp.raise_for_status()
+                    out_wav.write_bytes(audio_resp.content)
+                    log.debug("Downloaded FakeYou audio: %s", out_wav)
+                    return
+                except _requests.RequestException as exc:
+                    last_exc = exc
+                    if attempt < _FAKEYOU_DOWNLOAD_RETRIES:
+                        log.debug(
+                            "FakeYou download attempt %d/%d failed (%s), "
+                            "retrying in %ds…",
+                            attempt, _FAKEYOU_DOWNLOAD_RETRIES, exc,
+                            _FAKEYOU_DOWNLOAD_BACKOFF,
+                        )
+                        time.sleep(_FAKEYOU_DOWNLOAD_BACKOFF)
+            raise RuntimeError(
+                f"Failed to download FakeYou audio from {audio_url}: "
+                f"{last_exc}"
+            ) from last_exc
 
         if status in ("dead", "attempt_failed", "complete_failure"):
             raise RuntimeError(f"FakeYou job failed with status: {status}")
