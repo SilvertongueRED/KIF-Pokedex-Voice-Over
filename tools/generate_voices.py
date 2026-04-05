@@ -7,9 +7,22 @@ Generates TTS audio files for every Pokédex entry in your KIF game,
 voiced in the style of Dexter — the classic Pokémon anime Pokédex narrator.
 
 The script reads Pokédex description text from the game's PBS data files,
-synthesises speech with pyttsx3 (offline) or gTTS (online), and applies
-post-processing effects via pydub to produce the characteristic robotic,
-band-limited quality of the original Dexter voice.
+synthesises speech, and exports OGG Vorbis audio files.
+
+TTS backends
+------------
+  --backend fakeyou   (RECOMMENDED) Uses the FakeYou AI voice model
+                      "Pokedex (Pokemon, 4Kids)" — a community-trained model
+                      that replicates the real Dexter voice from the anime.
+                      Same approach used by github.com/adriantwarog/Pokedex-RL.
+                      Requires internet access.
+
+  --backend pyttsx3   Offline fallback — uses OS built-in voices (SAPI on
+                      Windows, NSSpeechSynthesizer on macOS, eSpeak on Linux)
+                      with post-processing effects.
+
+  --backend gtts      Online fallback — uses Google's Text-to-Speech API
+                      with post-processing effects.
 
 Output files are saved as OGG Vorbis to:
   <game-dir>/Mods/pokedex_voice_over/Audio/
@@ -21,6 +34,12 @@ Naming convention
 
 Usage
 -----
+  # RECOMMENDED — Generate using the real anime Pokédex voice via FakeYou
+  python generate_voices.py --game-dir /path/to/KIF --backend fakeyou
+
+  # With FakeYou priority queue access (faster generation)
+  python generate_voices.py --game-dir /path/to/KIF --backend fakeyou --fakeyou-cookie YOUR_COOKIE
+
   # Generate all regular Pokémon entries (creates files, skips existing ones)
   python generate_voices.py --game-dir /path/to/KIF
 
@@ -46,9 +65,11 @@ Requirements
 ------------
   pip install -r requirements.txt
 
-  On Windows, pyttsx3 uses the built-in SAPI voices (e.g. "Microsoft David
-  Desktop") which sound convincingly retro.  On macOS, it uses "Alex" or
-  similar.  On Linux, it uses eSpeak.
+  For --backend fakeyou:  requires the 'requests' package and internet access.
+
+  For --backend pyttsx3:  On Windows, uses the built-in SAPI voices (e.g.
+  "Microsoft David Desktop").  On macOS, it uses "Alex" or similar.  On
+  Linux, it uses eSpeak.
 
   ffmpeg must be installed and on your PATH for pydub to export OGG files.
 """
@@ -61,6 +82,8 @@ import re
 import shutil
 import sys
 import tempfile
+import time
+import uuid
 import warnings
 from pathlib import Path
 
@@ -79,6 +102,12 @@ try:
     HAS_GTTS = True
 except ImportError:
     HAS_GTTS = False
+
+try:
+    import requests as _requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
 
 try:
     # Suppress pydub's own RuntimeWarning about ffmpeg not being found at
@@ -440,6 +469,115 @@ def _generate_gtts(text: str, out_mp3: Path) -> None:
     tts.save(str(out_mp3))
 
 
+# ---------------------------------------------------------------------------
+# FakeYou TTS  (uses the real "Pokedex (Pokemon, 4Kids)" AI voice model)
+# ---------------------------------------------------------------------------
+# Same approach as github.com/adriantwarog/Pokedex-RL — calls the FakeYou
+# REST API with the community-trained Pokédex Dexter voice model.
+
+_FAKEYOU_MODEL_TOKEN = "weight_dh8zry5bgkfm0z6nv3anqa9y5"
+_FAKEYOU_INFERENCE_URL = "https://api.fakeyou.com/tts/inference"
+_FAKEYOU_JOB_URL = "https://api.fakeyou.com/tts/job/{}"
+_FAKEYOU_AUDIO_BASE = "https://storage.googleapis.com/vocodes-public"
+
+# Polling settings for waiting on FakeYou job completion
+_FAKEYOU_POLL_INTERVAL = 5      # seconds between status checks
+_FAKEYOU_MAX_WAIT = 120         # give up after this many seconds
+_FAKEYOU_RATE_LIMIT_WAIT = 15   # pause when rate-limited
+
+
+def _generate_fakeyou(text: str, out_wav: Path, cookie: str = "") -> None:
+    """Synthesise *text* with the FakeYou Pokédex voice model.
+
+    Submits a TTS inference job, polls until complete, and downloads
+    the resulting WAV file to *out_wav*.
+
+    Parameters
+    ----------
+    text : str
+        The Pokédex entry text to speak.
+    out_wav : Path
+        Destination file path (WAV format).
+    cookie : str
+        Optional FakeYou session cookie for priority queue access.
+        Without it, jobs go into the anonymous (slower) queue.
+    """
+    headers = {"Content-Type": "application/json", "Accept": "application/json"}
+    if cookie:
+        headers["Cookie"] = f"session={cookie}"
+
+    # 1. Submit TTS inference job
+    payload = {
+        "tts_model_token": _FAKEYOU_MODEL_TOKEN,
+        "uuid_idempotency_token": str(uuid.uuid4()),
+        "inference_text": text,
+    }
+    resp = _requests.post(
+        _FAKEYOU_INFERENCE_URL,
+        headers=headers,
+        json=payload,
+        timeout=30,
+    )
+    resp.raise_for_status()
+    result = resp.json()
+
+    if not result.get("success"):
+        raise RuntimeError(
+            f"FakeYou inference request failed: "
+            f"{result.get('error_reason', 'unknown error')}"
+        )
+
+    job_token = result.get("inference_job_token")
+    if not job_token:
+        raise RuntimeError("FakeYou returned no inference_job_token")
+
+    log.debug("FakeYou job submitted: %s", job_token)
+
+    # 2. Poll until the job finishes
+    elapsed = 0
+    while elapsed < _FAKEYOU_MAX_WAIT:
+        time.sleep(_FAKEYOU_POLL_INTERVAL)
+        elapsed += _FAKEYOU_POLL_INTERVAL
+
+        poll_resp = _requests.get(
+            _FAKEYOU_JOB_URL.format(job_token),
+            headers=headers,
+            timeout=30,
+        )
+        if poll_resp.status_code == 429:
+            log.debug("FakeYou rate-limited, waiting %ds…", _FAKEYOU_RATE_LIMIT_WAIT)
+            time.sleep(_FAKEYOU_RATE_LIMIT_WAIT)
+            elapsed += _FAKEYOU_RATE_LIMIT_WAIT
+            continue
+        poll_resp.raise_for_status()
+        state = poll_resp.json().get("state", {})
+        status = state.get("status", "")
+
+        log.debug("  Job %s status: %s (%.0fs)", job_token, status, elapsed)
+
+        if status == "complete_success":
+            wav_path = state.get("maybe_public_bucket_wav_audio_path")
+            if not wav_path:
+                raise RuntimeError("FakeYou job succeeded but returned no audio path")
+
+            # 3. Download the WAV file
+            audio_url = f"{_FAKEYOU_AUDIO_BASE}{wav_path}"
+            audio_resp = _requests.get(audio_url, timeout=60)
+            audio_resp.raise_for_status()
+            out_wav.write_bytes(audio_resp.content)
+            log.debug("Downloaded FakeYou audio: %s", out_wav)
+            return
+
+        if status in ("dead", "attempt_failed", "complete_failure"):
+            raise RuntimeError(f"FakeYou job failed with status: {status}")
+
+        # "pending", "started", "attempt_pending" → keep polling
+
+    raise RuntimeError(
+        f"FakeYou job timed out after {_FAKEYOU_MAX_WAIT}s (last status: {status})"
+    )
+
+
 def _apply_dexter_effect(audio: "AudioSegment") -> "AudioSegment":
     """
     Apply post-processing to make the voice sound like Dexter from the
@@ -463,7 +601,8 @@ def _apply_dexter_effect(audio: "AudioSegment") -> "AudioSegment":
 
 
 def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
-                        voice_index: int = 0) -> bool:
+                        voice_index: int = 0,
+                        fakeyou_cookie: str = "") -> bool:
     """
     Generate a single voiced OGG file at *dest_ogg*.
 
@@ -477,7 +616,18 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
 
         # ---- step 1: raw TTS -----------------------------------------------
         raw_path: Path | None = None
-        if backend in ("pyttsx3", "auto") and HAS_PYTTSX3:
+        used_fakeyou = False
+
+        if backend == "fakeyou" and HAS_REQUESTS:
+            raw_path = tmp / "raw.wav"
+            try:
+                _generate_fakeyou(text, raw_path, cookie=fakeyou_cookie)
+                used_fakeyou = True
+            except Exception as exc:
+                log.error("FakeYou failed: %s", exc)
+                raw_path = None
+
+        if raw_path is None and backend in ("pyttsx3", "auto") and HAS_PYTTSX3:
             raw_path = tmp / "raw.wav"
             try:
                 _generate_pyttsx3(text, raw_path, voice_index=voice_index)
@@ -496,15 +646,19 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
         if raw_path is None or not raw_path.exists():
             log.error(
                 "No TTS backend produced output.  "
-                "Install pyttsx3 (offline) or gTTS (online)."
+                "Install pyttsx3 (offline) or gTTS (online), "
+                "or use --backend fakeyou (requires internet)."
             )
             return False
 
         # ---- step 2: audio effects + export --------------------------------
+        # FakeYou already uses the real Pokédex AI voice model so the Dexter
+        # post-processing effects are unnecessary and would degrade quality.
         if HAS_PYDUB and HAS_FFMPEG:
             try:
                 audio = AudioSegment.from_file(str(raw_path))
-                audio = _apply_dexter_effect(audio)
+                if not used_fakeyou:
+                    audio = _apply_dexter_effect(audio)
                 audio.export(
                     str(dest_ogg),
                     format="ogg",
@@ -582,9 +736,22 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--backend",
-        choices=["auto", "pyttsx3", "gtts"],
+        choices=["auto", "pyttsx3", "gtts", "fakeyou"],
         default="auto",
-        help="TTS backend.  'auto' tries pyttsx3 then gTTS (default: auto).",
+        help=(
+            "TTS backend.  'fakeyou' (RECOMMENDED) uses the FakeYou AI voice "
+            "model trained on the real anime Pokédex voice.  'auto' tries "
+            "pyttsx3 then gTTS as offline/generic fallbacks (default: auto)."
+        ),
+    )
+    p.add_argument(
+        "--fakeyou-cookie",
+        metavar="COOKIE",
+        help=(
+            "FakeYou session cookie for authenticated (priority-queue) access.  "
+            "May also be set via the FAKEYOU_COOKIE environment variable.  "
+            "Without this, jobs use the anonymous queue which is slower."
+        ),
     )
     p.add_argument(
         "--voice",
@@ -628,11 +795,30 @@ def main(argv=None) -> int:
         return 1
 
     # ---- check at least one TTS backend is available ------------------------
-    if not HAS_PYTTSX3 and not HAS_GTTS:
+    fakeyou_cookie = args.fakeyou_cookie or os.environ.get("FAKEYOU_COOKIE", "")
+
+    if args.backend == "fakeyou":
+        if not HAS_REQUESTS:
+            log.error(
+                "FakeYou backend requires the 'requests' package.\n"
+                "Run:  pip install requests"
+            )
+            return 1
+        if fakeyou_cookie:
+            log.info("FakeYou: using authenticated session (cookie provided)")
+        else:
+            log.info(
+                "FakeYou: no cookie provided — using anonymous queue (slower).\n"
+                "  Set FAKEYOU_COOKIE env var or use --fakeyou-cookie for "
+                "priority access."
+            )
+    elif not HAS_PYTTSX3 and not HAS_GTTS:
         log.error(
             "No TTS backend found.  "
-            "Run:  pip install pyttsx3       (offline, recommended)\n"
-            "  or: pip install gTTS          (online, requires internet)"
+            "Run:  pip install pyttsx3       (offline, generic voice)\n"
+            "  or: pip install gTTS          (online, generic voice)\n"
+            "  or: pip install requests      (for --backend fakeyou — "
+            "RECOMMENDED, real anime voice)"
         )
         return 1
 
@@ -734,6 +920,7 @@ def main(argv=None) -> int:
             dest,
             backend=args.backend,
             voice_index=args.voice,
+            fakeyou_cookie=fakeyou_cookie,
         )
         if ok:
             generated += 1
@@ -771,6 +958,7 @@ def main(argv=None) -> int:
                 dest,
                 backend=args.backend,
                 voice_index=args.voice,
+                fakeyou_cookie=fakeyou_cookie,
             )
             if ok:
                 generated += 1
