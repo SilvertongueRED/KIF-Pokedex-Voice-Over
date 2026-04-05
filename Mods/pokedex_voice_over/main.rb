@@ -9,7 +9,7 @@
 # AUDIO FILES
 # -----------
 # Audio files must be placed in:
-#   <game root>/Mods/pokedex_voice_over/Audio/
+#   <game root>/Audio/SE/
 #
 # Naming convention:
 #   dex_SPECIES.ogg              — regular Pokémon  (e.g. dex_BULBASAUR.ogg)
@@ -20,8 +20,7 @@
 # =============================================================================
 
 module PokedexVoiceOver
-  MOD_ID    = "pokedex_voice_over"
-  AUDIO_DIR = "Mods/#{MOD_ID}/Audio"
+  MOD_ID = "pokedex_voice_over"
 
   # -------------------------------------------------------------------------
   # Settings helpers
@@ -92,26 +91,26 @@ module PokedexVoiceOver
 
     fused = species_str(fused_species)
 
-    filename = if fused
-                 "#{AUDIO_DIR}/dex_#{base}_#{fused}"
-               else
-                 "#{AUDIO_DIR}/dex_#{base}"
-               end
+    # Bare filename passed to Audio.se_play — RGSS auto-prepends Audio/SE/
+    bare = if fused
+             "dex_#{base}_#{fused}"
+           else
+             "dex_#{base}"
+           end
 
-    # RGSS will resolve the extension automatically (.ogg, .wav, .mp3) when
-    # no extension is appended to the path.  We also check for the files
-    # explicitly so we can skip without raising an error when absent.
+    # FileTest.exist? uses the real filesystem path (RGSS does NOT auto-prepend
+    # here), so check the full Audio/SE/ path with an explicit extension.
     found = [".ogg", ".wav", ".mp3"].any? do |ext|
-      FileTest.exist?("#{filename}#{ext}")
+      FileTest.exist?("Audio/SE/#{bare}#{ext}")
     end
     return unless found
 
     begin
-      # Stop any currently running ME so voice-overs don't overlap
-      Audio.me_stop
-      # ME (Music Effect) is used instead of SE because it supports longer
-      # clips and can be stopped cleanly when the player leaves the scene.
-      Audio.me_play(filename, volume, 100)
+      # Stop any currently running SE so voice-overs don't overlap
+      Audio.se_stop
+      # SE (Sound Effect) is used for playback; RGSS resolves the file from
+      # Audio/SE/ automatically when no directory prefix is included.
+      Audio.se_play(bare, volume, 100)
     rescue StandardError => e
       p "[PokedexVoiceOver] Audio playback error: #{e.message}" if $DEBUG
     end
@@ -119,7 +118,11 @@ module PokedexVoiceOver
 
   # Stop any playing voice-over.
   def self.stop
-    Audio.me_stop rescue nil
+    begin
+      Audio.se_stop
+    rescue StandardError => e
+      p "[PokedexVoiceOver] Audio stop error: #{e.message}" if $DEBUG
+    end
   end
 end
 

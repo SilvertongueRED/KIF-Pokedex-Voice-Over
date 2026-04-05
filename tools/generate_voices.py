@@ -25,7 +25,7 @@ TTS backends
                       with post-processing effects.
 
 Output files are saved as OGG Vorbis to:
-  <game-dir>/Mods/pokedex_voice_over/Audio/
+  <game-dir>/Audio/SE/
 
 Naming convention
 -----------------
@@ -45,6 +45,9 @@ Usage
 
   # Overwrite any previously generated files
   python generate_voices.py --game-dir /path/to/KIF --overwrite
+
+  # Retry only entries that failed in a previous run
+  python generate_voices.py --game-dir /path/to/KIF --retry-failed
 
   # Generate for a single species only
   python generate_voices.py --game-dir /path/to/KIF --species BULBASAUR
@@ -749,11 +752,11 @@ def _apply_dexter_effect(audio: "AudioSegment") -> "AudioSegment":
 
 def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
                         voice_index: int = 0,
-                        fakeyou_cookie: str = "") -> bool:
+                        fakeyou_cookie: str = "") -> tuple[bool, str]:
     """
     Generate a single voiced OGG file at *dest_ogg*.
 
-    Returns True on success, False on failure.
+    Returns (True, "") on success, (False, reason) on failure.
     """
     dest_ogg = Path(dest_ogg)
     dest_ogg.parent.mkdir(parents=True, exist_ok=True)
@@ -764,6 +767,7 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
         # ---- step 1: raw TTS -----------------------------------------------
         raw_path: Path | None = None
         used_fakeyou = False
+        failure_reason = ""
 
         if backend == "fakeyou" and HAS_REQUESTS:
             raw_path = tmp / "raw.wav"
@@ -772,31 +776,39 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
                 used_fakeyou = True
             except Exception as exc:
                 log.error("FakeYou failed: %s", exc)
+                failure_reason = str(exc)
                 raw_path = None
 
         if raw_path is None and backend in ("pyttsx3", "auto") and HAS_PYTTSX3:
             raw_path = tmp / "raw.wav"
             try:
                 _generate_pyttsx3(text, raw_path, voice_index=voice_index)
+                failure_reason = ""
             except Exception as exc:
                 log.debug("pyttsx3 failed: %s", exc)
+                if not failure_reason:
+                    failure_reason = str(exc)
                 raw_path = None
 
         if raw_path is None and backend in ("gtts", "auto") and HAS_GTTS:
             raw_path = tmp / "raw.mp3"
             try:
                 _generate_gtts(text, raw_path)
+                failure_reason = ""
             except Exception as exc:
                 log.debug("gTTS failed: %s", exc)
+                if not failure_reason:
+                    failure_reason = str(exc)
                 raw_path = None
 
         if raw_path is None or not raw_path.exists():
+            reason = failure_reason or "No TTS backend produced output"
             log.error(
                 "No TTS backend produced output.  "
                 "Install pyttsx3 (offline) or gTTS (online), "
                 "or use --backend fakeyou (requires internet)."
             )
-            return False
+            return False, reason
 
         # ---- step 2: audio effects + export --------------------------------
         # FakeYou already uses the real Pokédex AI voice model so the Dexter
@@ -815,14 +827,14 @@ def generate_voice_file(text: str, dest_ogg: Path, backend: str = "auto",
                 log.error("pydub processing failed: %s", exc)
                 # Fall back to raw copy
                 shutil.copy(str(raw_path), str(dest_ogg.with_suffix(raw_path.suffix)))
-                return True
+                return True, ""
         else:
             # No pydub or no ffmpeg — save the raw audio without Dexter effects.
             # The user has already been warned at startup; no per-file message needed.
             fallback = dest_ogg.with_suffix(raw_path.suffix)
             shutil.copy(str(raw_path), str(fallback))
 
-    return True
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +895,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         dest="fusions",
         action="store_false",
         help="Skip fusion Pokédex entries — generate only regular Pokémon.",
+    )
+    p.add_argument(
+        "--retry-failed",
+        action="store_true",
+        help=(
+            "Re-attempt only the entries that failed in a previous run.  "
+            "Reads failed_entries.json from the output directory and retries "
+            "only those entries.  Successful retries are removed from the log; "
+            "entries that fail again remain in it."
+        ),
     )
     p.add_argument(
         "--overwrite",
@@ -1029,7 +1051,7 @@ def main(argv=None) -> int:
         )
 
     # ---- resolve output directory -------------------------------------------
-    output_dir = game_dir / "Mods" / "pokedex_voice_over" / "Audio"
+    output_dir = game_dir / "Audio" / "SE"
     output_dir.mkdir(parents=True, exist_ok=True)
     log.info("Output directory: %s", output_dir)
 
@@ -1090,21 +1112,90 @@ def main(argv=None) -> int:
             return 1
         all_entries = {key: all_entries[key]}
 
-    # ---- process regular Pokémon entries ------------------------------------
+    # ---- load existing failure log ------------------------------------------
+    failure_log_path = output_dir / "failed_entries.json"
+    failure_log: dict = {}
+    if failure_log_path.exists():
+        try:
+            with open(failure_log_path, encoding="utf-8") as fh:
+                failure_log = json.load(fh)
+        except Exception as exc:
+            log.warning("Could not read failure log %s: %s", failure_log_path, exc)
+            failure_log = {}
+
+    # ---- build fusion entry map (needed even for --retry-failed) ------------
+    fusion_entries: dict = {}
+    if args.fusions:
+        if species_id_map:
+            fusion_entries = parse_kif_fusion_json(game_dir, species_id_map)
+        if not fusion_entries:
+            fusion_entries = parse_fusion_entries(game_dir)
+        if not fusion_entries and not args.retry_failed:
+            log.info(
+                "No fusion Pokédex entries found.  "
+                "KIF may use auto-generated fusion descriptions that are not "
+                "stored in data files."
+            )
+
+    # ---- build a lookup: filename → (text, dest) for retry mode ------------
+    def _all_pending_entries() -> list[tuple[str, str, Path]]:
+        """Return list of (filename, text, dest) for all entries to process."""
+        items = []
+        for species_name, entry_text in sorted(all_entries.items()):
+            dest = output_dir / f"dex_{species_name}.ogg"
+            items.append((dest.name, entry_text, dest))
+        if args.fusions:
+            for (sp1, sp2), entry_text in sorted(fusion_entries.items()):
+                dest = output_dir / f"dex_{sp1}_{sp2}.ogg"
+                items.append((dest.name, entry_text, dest))
+        return items
+
+    # ---- determine which entries to attempt ---------------------------------
+    if args.retry_failed:
+        if not failure_log:
+            log.info("No failure log found at %s — nothing to retry.", failure_log_path)
+            print("\nDone — generated: 0, skipped: 0, failed: 0")
+            print(f"Audio files saved to: {output_dir}")
+            return 0
+
+        # Build lookup of all entries so we can find text for failed filenames
+        all_pending = {fname: (text, dest) for fname, text, dest in _all_pending_entries()}
+        retry_filenames = list(failure_log.keys())
+        log.info(
+            "Retry mode: attempting %d previously failed entries from %s",
+            len(retry_filenames),
+            failure_log_path,
+        )
+        pending: list[tuple[str, str, Path]] = []
+        for fname in retry_filenames:
+            if fname in all_pending:
+                text, dest = all_pending[fname]
+                pending.append((fname, text, dest))
+            else:
+                log.warning(
+                    "Failed entry '%s' not found in current Pokédex data — skipping.",
+                    fname,
+                )
+    else:
+        pending = _all_pending_entries()
+
+    # ---- process entries ----------------------------------------------------
     generated = skipped = failed = 0
 
-    for species_name, entry_text in sorted(all_entries.items()):
-        dest = output_dir / f"dex_{species_name}.ogg"
+    for filename, entry_text, dest in pending:
+        # A fusion filename has two underscores: dex_SP1_SP2.ogg (count >= 2)
+        # A regular filename has one:            dex_SPECIES.ogg  (count == 1)
+        is_fusion = filename.count("_") >= 2
 
-        if not args.overwrite and dest.exists():
-            log.debug("Skipping %s (already exists)", dest.name)
+        if not args.overwrite and dest.exists() and not args.retry_failed:
+            log.debug("Skipping %s (already exists)", filename)
             skipped += 1
             continue
 
-        log.info("Generating: %s", dest.name)
+        log.info("Generating%s: %s", " fusion" if is_fusion else "", filename)
         log.debug("  Text: %s", entry_text[:80])
 
-        ok = generate_voice_file(
+        ok, reason = generate_voice_file(
             entry_text,
             dest,
             backend=args.backend,
@@ -1113,46 +1204,27 @@ def main(argv=None) -> int:
         )
         if ok:
             generated += 1
+            # Remove from failure log on success
+            failure_log.pop(filename, None)
         else:
             failed += 1
+            failure_log[filename] = reason
 
-    # ---- process fusion entries ---------------------------------------------
-    if args.fusions:
-        fusion_entries: dict = {}
-
-        # Try KIF JSON fusion data first
-        if species_id_map:
-            fusion_entries = parse_kif_fusion_json(game_dir, species_id_map)
-
-        # Fall back to PBS fusion files
-        if not fusion_entries:
-            fusion_entries = parse_fusion_entries(game_dir)
-
-        if not fusion_entries:
+    # ---- persist failure log ------------------------------------------------
+    try:
+        if failure_log:
+            with open(failure_log_path, "w", encoding="utf-8") as fh:
+                json.dump(failure_log, fh, indent=2)
             log.info(
-                "No fusion Pokédex entries found.  "
-                "KIF may use auto-generated fusion descriptions that are not "
-                "stored in data files."
+                "Failure log updated (%d entries): %s",
+                len(failure_log),
+                failure_log_path,
             )
-        for (sp1, sp2), entry_text in sorted(fusion_entries.items()):
-            dest = output_dir / f"dex_{sp1}_{sp2}.ogg"
-
-            if not args.overwrite and dest.exists():
-                skipped += 1
-                continue
-
-            log.info("Generating fusion: %s", dest.name)
-            ok = generate_voice_file(
-                entry_text,
-                dest,
-                backend=args.backend,
-                voice_index=args.voice,
-                fakeyou_cookie=fakeyou_cookie,
-            )
-            if ok:
-                generated += 1
-            else:
-                failed += 1
+        elif failure_log_path.exists():
+            # All entries succeeded — remove the now-empty log file
+            failure_log_path.unlink()
+    except Exception as exc:
+        log.warning("Could not write failure log %s: %s", failure_log_path, exc)
 
     # ---- summary ------------------------------------------------------------
     print(
