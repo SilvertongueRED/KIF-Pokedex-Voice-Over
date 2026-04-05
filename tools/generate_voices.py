@@ -9,6 +9,13 @@ voiced in the style of Dexter — the classic Pokémon anime Pokédex narrator.
 The script reads Pokédex description text from the game's PBS data files,
 synthesises speech, and exports OGG Vorbis audio files.
 
+Data sources (checked in order):
+  1. Data/species.dat     (KIF compiled species database — requires rubymarshal)
+  2. PBS/pokemon.txt      (vanilla PIF plain-text PBS)
+  3. Data/Scripts/990_NPT/001_Registration.rb (and similar Ruby scripts that
+     use GameData::Species.register({...}) blocks — supplementary species)
+  4. --pbs-file / --registration-file explicit overrides
+
 TTS backends
 ------------
   --backend fakeyou   (RECOMMENDED) Uses the FakeYou AI voice model
@@ -452,6 +459,159 @@ def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Registration.rb parsing (Data/Scripts/990_NPT/001_Registration.rb etc.)
+# ---------------------------------------------------------------------------
+
+# Regex to find each GameData::Species.register({...}) block.  The outer
+# braces may contain nested hash literals (e.g. base_stats: { ... }), so we
+# cannot just match the first '}' — instead we count brace depth.
+_REGISTER_START_RE = re.compile(
+    r"GameData::Species\.register\(\{", re.MULTILINE
+)
+
+# Field extractors applied to the text inside a single register block.
+_REG_ID_RE = re.compile(r"(?:^|\s)id:\s+:(\w+)", re.MULTILINE)
+_REG_ID_NUMBER_RE = re.compile(r"(?:^|\s)id_number:\s+(\d+)", re.MULTILINE)
+_REG_DEX_ENTRY_RE = re.compile(
+    r'pokedex_entry:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL
+)
+
+
+def _extract_register_blocks(content: str) -> list[str]:
+    """Return the text of each ``GameData::Species.register({...})`` block.
+
+    Handles nested braces (e.g. ``base_stats: { ... }``) by tracking brace
+    depth rather than relying on a single closing ``}``.
+    """
+    blocks: list[str] = []
+    for m in _REGISTER_START_RE.finditer(content):
+        # Start just after the opening '{'
+        start = m.end()
+        depth = 1
+        i = start
+        while i < len(content) and depth > 0:
+            ch = content[i]
+            if ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+            elif ch == '"':
+                # Skip over string literals so braces inside strings are
+                # not counted.
+                i += 1
+                while i < len(content) and content[i] != '"':
+                    if content[i] == "\\":
+                        i += 1  # skip escaped character
+                    i += 1
+            elif ch == "#":
+                # Skip single-line comments
+                while i < len(content) and content[i] != "\n":
+                    i += 1
+            i += 1
+        # depth == 0 → we found the matching '})'; extract the inner text
+        if depth == 0:
+            blocks.append(content[start : i - 1])
+    return blocks
+
+
+def parse_registration_rb(rb_file: Path) -> tuple[dict, dict]:
+    """
+    Parse a KIF Ruby registration script and return two dicts:
+
+    1. ``{SPECIES_NAME: entry_text}``  — Pokédex descriptions
+    2. ``{id_number: SPECIES_NAME}``   — numeric-ID-to-name mapping (for
+       fusion resolution via :func:`parse_kif_fusion_json`)
+
+    The expected format is ``GameData::Species.register({...})`` blocks
+    containing at minimum ``id:``, ``id_number:``, and ``pokedex_entry:``
+    fields (KIF's ``Data/Scripts/990_NPT/001_Registration.rb``).
+    """
+    entries: dict = {}
+    id_map: dict = {}
+
+    if not rb_file.is_file():
+        log.debug("Registration script not found: %s", rb_file)
+        return entries, id_map
+
+    try:
+        content = rb_file.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("Cannot read %s: %s", rb_file, exc)
+        return entries, id_map
+
+    blocks = _extract_register_blocks(content)
+
+    for block in blocks:
+        id_match = _REG_ID_RE.search(block)
+        if not id_match:
+            continue
+        species_name = id_match.group(1).upper()
+
+        # id_number (optional — only needed for fusion ID mapping)
+        num_match = _REG_ID_NUMBER_RE.search(block)
+        if num_match:
+            try:
+                id_number = int(num_match.group(1))
+                id_map[id_number] = species_name
+            except ValueError:
+                pass
+
+        # pokedex_entry
+        entry_match = _REG_DEX_ENTRY_RE.search(block)
+        if not entry_match:
+            continue
+        raw_text = entry_match.group(1)
+        entry_text = _clean_entry_text(raw_text)
+        if entry_text:
+            entries[species_name] = entry_text
+
+    if entries:
+        log.info(
+            "Parsed %d Pokédex entries (%d with id_number) from %s",
+            len(entries),
+            len(id_map),
+            rb_file.name,
+        )
+    return entries, id_map
+
+
+def find_registration_scripts(game_dir: Path) -> list[Path]:
+    """Discover Registration.rb files under ``Data/Scripts/``.
+
+    Returns a list of paths, checking:
+    - ``Data/Scripts/990_NPT/001_Registration.rb`` (primary known location)
+    - Any ``*.rb`` files under ``Data/Scripts/990_NPT/``
+    - Any file matching ``**/001_Registration.rb`` elsewhere in ``Data/Scripts/``
+    """
+    scripts_dir = game_dir / "Data" / "Scripts"
+    found: list[Path] = []
+    seen: set[Path] = set()
+
+    # Primary known location
+    primary = scripts_dir / "990_NPT" / "001_Registration.rb"
+    if primary.is_file():
+        found.append(primary)
+        seen.add(primary.resolve())
+
+    # Any other .rb files in the 990_NPT directory
+    npt_dir = scripts_dir / "990_NPT"
+    if npt_dir.is_dir():
+        for rb in sorted(npt_dir.glob("*.rb")):
+            if rb.resolve() not in seen:
+                found.append(rb)
+                seen.add(rb.resolve())
+
+    # Glob for Registration.rb elsewhere in Data/Scripts/
+    if scripts_dir.is_dir():
+        for rb in sorted(scripts_dir.glob("**/001_Registration.rb")):
+            if rb.resolve() not in seen:
+                found.append(rb)
+                seen.add(rb.resolve())
+
+    return found
+
+
+# ---------------------------------------------------------------------------
 # TTS generation
 # ---------------------------------------------------------------------------
 
@@ -882,6 +1042,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--registration-file",
+        metavar="PATH",
+        action="append",
+        default=None,
+        help=(
+            "Explicit path to a KIF Registration.rb script that contains "
+            "GameData::Species.register({...}) blocks.  May be specified "
+            "multiple times.  If omitted, the script auto-discovers "
+            "Registration.rb files under Data/Scripts/."
+        ),
+    )
+    p.add_argument(
         "--species",
         metavar="NAME",
         help="Generate a file for one species only (e.g. BULBASAUR).",
@@ -1084,7 +1256,34 @@ def main(argv=None) -> int:
         if pbs_file.is_file():
             all_entries = parse_pbs_pokemon(pbs_file)
 
-    # 3. Give up with a helpful error
+    # 3. Registration.rb scripts (Data/Scripts/990_NPT/001_Registration.rb
+    #    and similar) — supplementary source that adds species which may not
+    #    be present in species.dat or PBS.
+    reg_files: list[Path] = []
+    if args.registration_file:
+        reg_files = [Path(p) for p in args.registration_file]
+    else:
+        reg_files = find_registration_scripts(game_dir)
+
+    reg_total_entries = 0
+    for rf in reg_files:
+        rb_entries, rb_id_map = parse_registration_rb(rf)
+        # Merge without overwriting — species.dat / PBS entries take priority
+        for name, text in rb_entries.items():
+            if name not in all_entries:
+                all_entries[name] = text
+                reg_total_entries += 1
+        for num, name in rb_id_map.items():
+            if num not in species_id_map:
+                species_id_map[num] = name
+    if reg_total_entries:
+        log.info(
+            "Registration scripts added %d new Pokédex entries (total now %d)",
+            reg_total_entries,
+            len(all_entries),
+        )
+
+    # 4. Give up with a helpful error
     if not all_entries:
         has_species_dat = species_dat.is_file()
         if has_species_dat and not HAS_RUBYMARSHAL:
@@ -1101,7 +1300,9 @@ def main(argv=None) -> int:
                 "  Checked:\n"
                 "    - %s  (not found)\n"
                 "    - %s  (not found)\n"
-                "  If your PBS file is elsewhere, use --pbs-file to specify its path.",
+                "    - Data/Scripts/**/001_Registration.rb  (not found)\n"
+                "  If your PBS file is elsewhere, use --pbs-file to specify its path.\n"
+                "  If you have a Registration.rb file, use --registration-file.",
                 species_dat,
                 game_dir / "PBS" / "pokemon.txt",
             )
