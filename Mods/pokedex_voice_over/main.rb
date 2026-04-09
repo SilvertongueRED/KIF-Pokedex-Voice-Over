@@ -22,6 +22,15 @@
 #
 # Run  tools/generate_voices.py  from the repository to generate these files
 # from your game's PBS data.
+#
+# DIAGNOSTIC LOG
+# --------------
+# The mod writes a diagnostic log to:
+#   <game root>/Mods/pokedex_voice_over/debug.log
+#
+# Check this file if audio does not play — it records every hook call,
+# species detection attempt, file-existence check, and playback call so
+# you can see exactly where the process stops.
 # =============================================================================
 
 module PokedexVoiceOver
@@ -33,6 +42,18 @@ module PokedexVoiceOver
   # Fallback playback duration (seconds) used when dex_durations.json has no
   # entry for a given file.  5 seconds covers most Pokédex entries comfortably.
   SEQUENTIAL_DURATION_FALLBACK = 5.0
+
+  # Diagnostic log file — always written so users can report issues.
+  LOG_FILE = "Mods/pokedex_voice_over/debug.log"
+
+  # -------------------------------------------------------------------------
+  # Diagnostic logging — writes to LOG_FILE on every significant event
+  # -------------------------------------------------------------------------
+
+  def self.log(msg)
+    line = "[#{Time.now.strftime('%H:%M:%S')}] #{msg}"
+    File.open(LOG_FILE, "a") { |f| f.puts(line) } rescue nil
+  end
 
   # -------------------------------------------------------------------------
   # Settings helpers
@@ -117,17 +138,36 @@ module PokedexVoiceOver
   # supply the full path including the subdirectory and extension.
   def self._audio_exists?(bare_name)
     [".ogg", ".wav", ".mp3"].any? do |ext|
-      FileTest.exist?("Audio/SE/#{bare_name}#{ext}")
+      path = "Audio/SE/#{bare_name}#{ext}"
+      found = FileTest.exist?(path)
+      log("  _audio_exists? #{path} => #{found}")
+      found
     end
   end
 
   # Play a single audio file (bare_name is relative to Audio/SE/).
   # Stops any currently playing SE first.
+  #
+  # Tries the bare path first (standard RGSS resolves relative to Audio/SE/),
+  # then falls back to the full "Audio/SE/" prefixed path in case the engine
+  # needs it (some MKXP builds behave differently).
   def self._play_bare(bare_name)
     Audio.se_stop
-    # RGSS resolves paths relative to Audio/SE/ — the AUDIO_SUBDIR prefix is
-    # enough; no "Audio/SE/" prefix needed here.
-    Audio.se_play(bare_name, volume, 100)
+    log("  _play_bare: Audio.se_play('#{bare_name}', #{volume}, 100)")
+    begin
+      Audio.se_play(bare_name, volume, 100)
+      return
+    rescue StandardError => e
+      log("  _play_bare: bare path failed (#{e.class}: #{e.message})")
+    end
+    # Fallback: try with "Audio/SE/" prefix
+    full = "Audio/SE/#{bare_name}"
+    log("  _play_bare: retrying with Audio.se_play('#{full}', #{volume}, 100)")
+    begin
+      Audio.se_play(full, volume, 100)
+    rescue StandardError => e
+      log("  _play_bare: full path also failed (#{e.class}: #{e.message})")
+    end
   end
 
   # -------------------------------------------------------------------------
@@ -142,14 +182,17 @@ module PokedexVoiceOver
   #      in a background thread (head first, then body after the head
   #      finishes — timed using the dex_durations.json manifest).
   #
-  # Silently returns if no matching audio can be found.
+  # Returns silently if no matching audio can be found.
   def self.play(species, fused_species = nil)
+    log("play() called — enabled=#{enabled?}, species=#{species.inspect}, fused=#{fused_species.inspect}")
     return unless enabled?
 
     base = species_str(species)
+    log("  base species_str => #{base.inspect}")
     return unless base
 
     fused = species_str(fused_species)
+    log("  fused species_str => #{fused.inspect}")
 
     # Advance the generation counter to invalidate any in-progress sequential
     # playback thread without forcibly killing it.
@@ -160,10 +203,11 @@ module PokedexVoiceOver
 
       if _audio_exists?(fusion_bare)
         # Dedicated fusion file — play it directly
+        log("  Playing dedicated fusion audio: #{fusion_bare}")
         begin
           _play_bare(fusion_bare)
         rescue StandardError => e
-          p "[PokedexVoiceOver] Audio playback error: #{e.message}" if $DEBUG
+          log("  Fusion playback error: #{e.class}: #{e.message}")
         end
       else
         # No custom fusion entry — fall back to sequential base-species playback
@@ -171,6 +215,7 @@ module PokedexVoiceOver
         bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
 
         if _audio_exists?(bare_head) && _audio_exists?(bare_body)
+          log("  Playing sequential: #{bare_head} then #{bare_body}")
           head_duration = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
           vol = volume        # capture for thread closure
           my_gen = @playback_gen  # snapshot so the thread can self-cancel
@@ -190,22 +235,28 @@ module PokedexVoiceOver
                 end
                 Audio.se_play(bare_body, vol, 100) if @playback_gen == my_gen
               rescue StandardError => e
-                p "[PokedexVoiceOver] Sequential playback error: #{e.message}" if $DEBUG
+                log("  Sequential playback error: #{e.class}: #{e.message}")
               end
             end
           rescue StandardError => e
-            p "[PokedexVoiceOver] Audio playback error: #{e.message}" if $DEBUG
+            log("  Thread creation error: #{e.class}: #{e.message}")
           end
+        else
+          log("  No fusion or sequential audio available — skipping")
         end
       end
     else
       bare = "#{AUDIO_SUBDIR}/dex_#{base}"
-      return unless _audio_exists?(bare)
+      unless _audio_exists?(bare)
+        log("  No audio file found — skipping")
+        return
+      end
 
+      log("  Playing single species audio: #{bare}")
       begin
         _play_bare(bare)
       rescue StandardError => e
-        p "[PokedexVoiceOver] Audio playback error: #{e.message}" if $DEBUG
+        log("  Playback error: #{e.class}: #{e.message}")
       end
     end
   end
@@ -217,7 +268,7 @@ module PokedexVoiceOver
     begin
       Audio.se_stop
     rescue StandardError => e
-      p "[PokedexVoiceOver] Audio stop error: #{e.message}" if $DEBUG
+      log("stop error: #{e.class}: #{e.message}")
     end
   end
 end
@@ -232,30 +283,95 @@ end
 #
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
+#
+# KNOWN BUG FIXES (v1.1.0)
+# -------------------------
+# - Instance-variable access (e.g. `@page rescue fallback`) does NOT raise
+#   in Ruby — undefined ivars return nil silently.  Replaced with explicit
+#   nil-checks so the fallback values are actually used.
+# - Fusion-species fallback chain now uses instance_variable_defined? so
+#   alternate variable names (@dexSpecies2, etc.) are actually tried.
+# - Species detection now also checks @dexlist[@index] (common Essentials
+#   pattern) as a fallback when @species is not set.
 # =============================================================================
 
+PokedexVoiceOver.log("=" * 60)
+PokedexVoiceOver.log("Pokédex Voice Over mod loading...")
+PokedexVoiceOver.log("  Ruby version: #{RUBY_VERSION rescue 'unknown'}")
+PokedexVoiceOver.log("  defined?(PokemonPokedexInfo_Scene) = #{defined?(PokemonPokedexInfo_Scene).inspect}")
+
 if defined?(PokemonPokedexInfo_Scene)
+  PokedexVoiceOver.log("  PokemonPokedexInfo_Scene exists — installing hooks")
+  PokedexVoiceOver.log("  Instance methods: #{PokemonPokedexInfo_Scene.instance_methods(false).sort.inspect}")
+
   class PokemonPokedexInfo_Scene
     POKEDEX_VO_ENTRY_PAGE = 0   # page index that shows the Pokédex description
 
     # Helper: read the current species + fusion partner from scene state.
-    # Tries several variable names used across PIF / KIF versions.
+    #
+    # Searches multiple instance-variable names used across different
+    # PIF / KIF versions.  Uses instance_variable_defined? instead of
+    # rescue — Ruby ivars return nil silently, so rescue never triggers.
     def pokedex_vo_current_species
-      head  = @species rescue nil
-      # Fusion partner: different KIF / PIF versions use different names
-      fused = begin
-                @fusedSpecies
-              rescue StandardError
-                begin
-                  @dexSpecies2
-                rescue StandardError
-                  begin
-                    @speciesFused
-                  rescue StandardError
-                    nil
-                  end
-                end
-              end
+      # --- Head species ---
+      head = nil
+
+      # Direct ivar names used in various KIF / PIF builds
+      [:@species, :@current_species, :@dexdata].each do |var|
+        if instance_variable_defined?(var)
+          val = instance_variable_get(var)
+          next if val.nil?
+          head = val
+          PokedexVoiceOver.log("  Head species found in #{var}: #{val.inspect}")
+          break
+        end
+      end
+
+      # Fallback: Essentials stores species in @dexlist[@index]
+      if head.nil? && instance_variable_defined?(:@dexlist) && instance_variable_defined?(:@index)
+        begin
+          entry = instance_variable_get(:@dexlist)[instance_variable_get(:@index)]
+          if entry
+            # entry may be an Array [species, ...], a Hash, or an object
+            if entry.is_a?(Array)
+              head = entry[0]
+            elsif entry.respond_to?(:species)
+              head = entry.species
+            elsif entry.is_a?(Hash)
+              head = entry[:species] || entry[:id]
+            else
+              head = entry
+            end
+            PokedexVoiceOver.log("  Head species found via @dexlist[@index]: #{head.inspect}")
+          end
+        rescue StandardError => e
+          PokedexVoiceOver.log("  @dexlist[@index] lookup failed: #{e.message}")
+        end
+      end
+
+      if head.nil?
+        PokedexVoiceOver.log("  WARNING: Could not find head species")
+        vars = instance_variables.select { |v| v.to_s =~ /species|dexlist|dexdata|fused|fusion|pokemon/i }
+        vars.each do |v|
+          PokedexVoiceOver.log("    #{v} = #{instance_variable_get(v).inspect rescue '<error>'}")
+        end
+        # Log ALL instance variables so the user can report them
+        PokedexVoiceOver.log("  All scene ivars: #{instance_variables.sort.inspect}")
+      end
+
+      # --- Fused species ---
+      fused = nil
+      [:@fusedSpecies, :@dexSpecies2, :@speciesFused, :@fused_species, :@species2].each do |var|
+        if instance_variable_defined?(var)
+          val = instance_variable_get(var)
+          next if val.nil?
+          next if val.is_a?(Integer) && val <= 0
+          fused = val
+          PokedexVoiceOver.log("  Fused species found in #{var}: #{val.inspect}")
+          break
+        end
+      end
+
       [head, fused]
     end
 
@@ -263,28 +379,44 @@ if defined?(PokemonPokedexInfo_Scene)
     # pbStartScene  — play when the Pokédex entry scene first opens
     # ------------------------------------------------------------------
     if method_defined?(:pbStartScene)
+      PokedexVoiceOver.log("  Aliasing pbStartScene")
       alias dex_vo_orig_pbStartScene pbStartScene
 
       def pbStartScene(*args)
         dex_vo_orig_pbStartScene(*args)
-        # After the scene is set up, play the voice for the entry page
-        page = @page rescue POKEDEX_VO_ENTRY_PAGE
-        if page == POKEDEX_VO_ENTRY_PAGE
+
+        # NOTE: @page is nil (not an error) if the original method hasn't
+        # set it yet.  In Ruby, accessing an undefined ivar returns nil —
+        # it does NOT raise, so `rescue` never triggers.  We treat nil as
+        # "we're on the entry page" because pbStartScene always opens to
+        # the default page.
+        page = @page
+        PokedexVoiceOver.log("pbStartScene fired — @page=#{page.inspect}, entry_page=#{POKEDEX_VO_ENTRY_PAGE}")
+
+        if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
           PokedexVoiceOver.play(head, fused)
+        else
+          PokedexVoiceOver.log("  Skipping — page #{page} is not the entry page (#{POKEDEX_VO_ENTRY_PAGE})")
+          PokedexVoiceOver.log("  Hint: if the voice should play here, set POKEDEX_VO_ENTRY_PAGE = #{page}")
         end
       end
+    else
+      PokedexVoiceOver.log("  WARNING: pbStartScene is NOT defined — cannot hook scene open")
     end
 
     # ------------------------------------------------------------------
     # pbShowPage  — play (optionally) when returning to the entry page
     # ------------------------------------------------------------------
     if method_defined?(:pbShowPage)
+      PokedexVoiceOver.log("  Aliasing pbShowPage")
       alias dex_vo_orig_pbShowPage pbShowPage
 
       def pbShowPage(page, *args)
-        prev_page = @page rescue nil
+        prev_page = @page  # nil if not yet set (see note in pbStartScene)
         dex_vo_orig_pbShowPage(page, *args)
+
+        PokedexVoiceOver.log("pbShowPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
 
         # Only play when the user navigates TO the entry page, not on every
         # call.  We also honour the "play_on_page_change" setting so players
@@ -297,18 +429,46 @@ if defined?(PokemonPokedexInfo_Scene)
           end
         end
       end
+    else
+      PokedexVoiceOver.log("  WARNING: pbShowPage is NOT defined — cannot hook page changes")
     end
 
     # ------------------------------------------------------------------
     # pbEndScene  — stop the voice when the scene closes
     # ------------------------------------------------------------------
     if method_defined?(:pbEndScene)
+      PokedexVoiceOver.log("  Aliasing pbEndScene")
       alias dex_vo_orig_pbEndScene pbEndScene
 
       def pbEndScene(*args)
+        PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
         dex_vo_orig_pbEndScene(*args)
       end
+    else
+      PokedexVoiceOver.log("  WARNING: pbEndScene is NOT defined — cannot hook scene close")
     end
   end
+
+  PokedexVoiceOver.log("Hook installation complete")
+else
+  PokedexVoiceOver.log("ERROR: PokemonPokedexInfo_Scene is NOT defined!")
+  PokedexVoiceOver.log("  The mod cannot hook into the Pokédex scene.")
+  PokedexVoiceOver.log("  This usually means the mod loaded BEFORE the game's Pokédex scripts.")
+  # Try to discover any Pokédex-related classes so we can suggest the right name
+  begin
+    pokedex_classes = ObjectSpace.each_object(Class).select do |c|
+      c.name.to_s =~ /pokedex|dex.*info|dex.*scene/i rescue false
+    end
+    if pokedex_classes.any?
+      PokedexVoiceOver.log("  Pokédex-related classes found: #{pokedex_classes.map(&:name).sort.inspect}")
+    else
+      PokedexVoiceOver.log("  No Pokédex-related classes found — the class may load later")
+    end
+  rescue StandardError => e
+    PokedexVoiceOver.log("  ObjectSpace scan failed: #{e.message}")
+  end
 end
+
+PokedexVoiceOver.log("Mod loading finished")
+PokedexVoiceOver.log("=" * 60)
