@@ -248,7 +248,7 @@ TTS audio is saved without effects.
 | FakeYou returns "rate limited" | Wait a few minutes and try again. With a FakeYou account you get higher rate limits. For large batches, the script automatically pauses and retries. |
 | FakeYou login/cookie error | Make sure your FakeYou username/password are correct. If passing a cookie manually, you only need the token value — the script handles `session=` prefixes automatically. |
 | `requests` not installed | Run `pip install -r tools/requirements.txt` to install all dependencies including `requests` (needed for `--backend fakeyou`). |
-| No voice plays | Check that `.ogg` files are in `Audio/SE/` (inside your KIF game root) |
+| No voice plays | Check `Mods/pokedex_voice_over/debug.log` for diagnostics.  Verify `.ogg` files are in `Audio/SE/Pokedex/` (inside your KIF game root).  The log shows whether hooks were installed, what species was detected, and whether the audio file was found. |
 | Some entries failed to generate | Re-run with `--retry-failed` to retry only the failed entries — check `Audio/SE/failed_entries.json` for details |
 | `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically.  If your game stores species in a `Registration.rb` script, use `--registration-file /path/to/001_Registration.rb`. |
 | `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
