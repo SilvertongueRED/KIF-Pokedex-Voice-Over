@@ -351,7 +351,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
       if head.nil?
         PokedexVoiceOver.log("  WARNING: Could not find head species")
-        vars = instance_variables.select { |v| v.to_s =~ /spec|dex|fus|poke/i }
+        vars = instance_variables.select { |v| v.to_s =~ /species|dexlist|dexdata|fused|fusion|pokemon/i }
         vars.each do |v|
           PokedexVoiceOver.log("    #{v} = #{instance_variable_get(v).inspect rescue '<error>'}")
         end
