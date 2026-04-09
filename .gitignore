@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Diagnostic log written at runtime by the mod — user-specific, not committed
+Mods/pokedex_voice_over/debug.log
