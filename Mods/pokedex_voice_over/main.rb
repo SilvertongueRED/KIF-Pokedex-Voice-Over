@@ -612,9 +612,17 @@ PokedexVoiceOver.log("=" * 60)
 # Mod Settings menu registration (Stonewall's Mod Settings mod)
 # =============================================================================
 # Registers all settings under the "Interface" category so they appear in
-# the in-game Mod Settings menu.  Safely skipped when the Mod Settings mod is
-# not installed.
-if defined?(ModSettingsMenu)
+# the in-game Mod Settings menu (Options > Mod Settings).
+#
+# When the Mod Settings system has already loaded, we register immediately.
+# Otherwise we queue the registrations via $MOD_SETTINGS_PENDING_REGISTRATIONS
+# so they are picked up once the Mod Settings system initialises later.
+# This handles the common case where this mod's script runs before the Mod
+# Settings mod has been loaded.
+#
+# See: https://github.com/Stonewallx/KIF-Mods/blob/main/Documentation/Mod%20Settings.md
+
+pokedex_vo_register_settings = proc {
   ModSettingsMenu.register(:pokedex_vo_enabled, {
     name: "Pokédex Voice Over",
     type: :toggle,
@@ -649,4 +657,13 @@ if defined?(ModSettingsMenu)
     default: 0,
     category: "Interface"
   })
+}
+
+if defined?(ModSettingsMenu)
+  # Mod Settings system is already available — register immediately.
+  pokedex_vo_register_settings.call
+else
+  # Mod Settings system hasn't loaded yet — queue for later processing.
+  $MOD_SETTINGS_PENDING_REGISTRATIONS ||= []
+  $MOD_SETTINGS_PENDING_REGISTRATIONS << pokedex_vo_register_settings
 end
