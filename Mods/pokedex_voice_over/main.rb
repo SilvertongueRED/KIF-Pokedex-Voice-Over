@@ -284,6 +284,13 @@ end
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
 #
+# KNOWN BUG FIXES (v1.2.0)
+# -------------------------
+# - POKEDEX_VO_ENTRY_PAGE was 0 but KIF uses 1-based page indices — the
+#   entry/description page is page 1.  Changed default to 1.
+# - pbShowPage does not exist in KIF — added a fallback hook on drawPage
+#   so the "play_on_page_change" feature works in KIF builds.
+#
 # KNOWN BUG FIXES (v1.1.0)
 # -------------------------
 # - Instance-variable access (e.g. `@page rescue fallback`) does NOT raise
@@ -305,7 +312,7 @@ if defined?(PokemonPokedexInfo_Scene)
   PokedexVoiceOver.log("  Instance methods: #{PokemonPokedexInfo_Scene.instance_methods(false).sort.inspect}")
 
   class PokemonPokedexInfo_Scene
-    POKEDEX_VO_ENTRY_PAGE = 0   # page index that shows the Pokédex description
+    POKEDEX_VO_ENTRY_PAGE = 1   # page index that shows the Pokédex description (KIF uses 1-based pages)
 
     # Helper: read the current species + fusion partner from scene state.
     #
@@ -430,7 +437,30 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
     else
-      PokedexVoiceOver.log("  WARNING: pbShowPage is NOT defined — cannot hook page changes")
+      PokedexVoiceOver.log("  pbShowPage is NOT defined — trying drawPage as fallback")
+
+      # KIF uses drawPage instead of pbShowPage for page rendering.
+      # Hook it so the "play_on_page_change" feature still works.
+      if method_defined?(:drawPage)
+        PokedexVoiceOver.log("  Aliasing drawPage (fallback for pbShowPage)")
+        alias dex_vo_orig_drawPage drawPage
+
+        def drawPage(page, *args)
+          prev_page = @page  # capture before the original method updates it
+          dex_vo_orig_drawPage(page, *args)
+
+          PokedexVoiceOver.log("drawPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
+
+          if page == POKEDEX_VO_ENTRY_PAGE && prev_page != POKEDEX_VO_ENTRY_PAGE
+            if PokedexVoiceOver.play_on_page_change?
+              head, fused = pokedex_vo_current_species
+              PokedexVoiceOver.play(head, fused)
+            end
+          end
+        end
+      else
+        PokedexVoiceOver.log("  WARNING: Neither pbShowPage nor drawPage defined — cannot hook page changes")
+      end
     end
 
     # ------------------------------------------------------------------
