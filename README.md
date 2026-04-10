@@ -13,8 +13,14 @@ including every fused variant.
   entry
 - 🧬 Works for **all fused Pokémon** combinations (head × body) when
   fusion-specific audio files are available
-- ⚙️ In-game settings (volume, enable/disable, re-read on page return) via
-  the KIF Mod Manager
+- 🔀 **Multiple entry variants** — fusions with multiple possible Pokédex
+  descriptions get separate audio files; the mod randomly selects one each
+  time, matching the game's randomised entry behaviour
+- 🎵 **Music pauses while the Pokédex is open** — background music fades out
+  when you enter the Pokédex and resumes when you exit, not just during
+  voice playback
+- ⚙️ In-game settings submenu (volume, enable/disable, mute music, re-read
+  on page return) via Stonewall's **Mod Settings** under Interface
 - 🔇 Silently skips entries that have no audio file — safe to install before
   generating audio
 - 🛑 Automatically stops the voice when you close the Pokédex
@@ -139,7 +145,13 @@ Audio files are named after the Pokémon's internal species name:
 |---|---|
 | `dex_BULBASAUR.ogg` | Bulbasaur |
 | `dex_CHARMANDER.ogg` | Charmander |
-| `dex_BULBASAUR_CHARMANDER.ogg` | Bulbasaur/Charmander fusion |
+| `dex_BULBASAUR_CHARMANDER.ogg` | Bulbasaur/Charmander fusion (primary entry) |
+| `dex_BULBASAUR_CHARMANDER_v2.ogg` | Bulbasaur/Charmander fusion (variant entry 2) |
+| `dex_BULBASAUR_CHARMANDER_v3.ogg` | Bulbasaur/Charmander fusion (variant entry 3) |
+
+Variant files (`_v2`, `_v3`, …) are only generated for fusions that have
+multiple different Pokédex descriptions in `Data/pokedex/dex.json`.  The mod
+detects these at playback time and randomly selects one.
 
 ### Step 3 — Launch KIF
 
@@ -150,13 +162,19 @@ Pokédex entry and the voice will play.
 
 ## Mod Settings
 
-Access settings from **Title Screen → Mod Manager → Installed Mods →
-Pokédex Voice Over → Settings**.
+If **Stonewall's Mod Settings** is installed, settings are available under
+**Options → Mod Settings → Interface → Pokédex Voice Over** (opens a
+dedicated submenu).
+
+Settings are also accessible from the KIF Mod Manager:
+**Title Screen → Mod Manager → Installed Mods → Pokédex Voice Over →
+Settings**.
 
 | Setting | Default | Description |
 |---|---|---|
 | **Enable Voice Over** | On | Master on/off switch |
 | **Voice Volume** | 80 | Playback volume (0–100) |
+| **Mute Music in Pokédex** | On | Fade out background music while the Pokédex is open |
 | **Re-read on Page Return** | Off | Re-play the voice when navigating back to the description page |
 
 ---
