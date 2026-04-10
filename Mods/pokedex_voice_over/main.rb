@@ -132,6 +132,7 @@ module PokedexVoiceOver
       log("  BGM muted (saved: #{@saved_bgm.inspect})")
     rescue => e
       log("  BGM mute failed: #{e.message}")
+      @bgm_muted = false
     end
   end
 
@@ -221,7 +222,9 @@ module PokedexVoiceOver
 
     # Check for _v2, _v3, ... up to a reasonable limit
     n = 2
+    max_variants = 20
     loop do
+      break if n > max_variants
       candidate = "#{bare_name}_v#{n}"
       if _audio_exists?(candidate)
         variants << candidate
