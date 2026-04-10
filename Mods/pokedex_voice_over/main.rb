@@ -118,10 +118,13 @@ module PokedexVoiceOver
   # BGM mute / restore helpers
   # -------------------------------------------------------------------------
 
-  # Save the currently playing BGM and fade it out so the voice-over is
-  # audible.  Does nothing when the mute_music setting is disabled.
-  def self._save_and_mute_bgm
+  # Save the currently playing BGM and fade it out.
+  # Called when the Pokédex scene opens so the voice-over (and the browsing
+  # experience in general) is not drowned out by background music.
+  # Does nothing when the mute_music setting is disabled.
+  def self.save_and_mute_bgm
     return unless mute_music?
+    return if @bgm_muted  # already muted — don't overwrite the saved BGM
     begin
       @saved_bgm = $game_system.playing_bgm.clone rescue nil
       Audio.bgm_fade(500) rescue nil
@@ -129,12 +132,13 @@ module PokedexVoiceOver
       log("  BGM muted (saved: #{@saved_bgm.inspect})")
     rescue => e
       log("  BGM mute failed: #{e.message}")
+      @bgm_muted = false
     end
   end
 
   # Restore the previously saved BGM.  Safe to call multiple times — does
   # nothing if no BGM was muted.
-  def self._restore_bgm
+  def self.restore_bgm
     return unless @bgm_muted
     begin
       if @saved_bgm
@@ -203,6 +207,37 @@ module PokedexVoiceOver
     end
   end
 
+  # Find all variant audio files for a given base bare_name.
+  # Returns a list of bare names (relative to Audio/SE/) including the primary
+  # file and any variant files (e.g. dex_BULBASAUR_CHARMANDER_v2).
+  #
+  # Variant naming convention:
+  #   Pokedex/dex_SPECIES.ogg          — primary
+  #   Pokedex/dex_SPECIES_v2.ogg       — variant 2
+  #   Pokedex/dex_SPECIES_v3.ogg       — variant 3
+  #   Pokedex/dex_SP1_SP2_v2.ogg       — fusion variant 2
+  def self._find_variants(bare_name)
+    variants = []
+    variants << bare_name if _audio_exists?(bare_name)
+
+    # Check for _v2, _v3, ... up to a reasonable limit
+    n = 2
+    max_variants = 20
+    loop do
+      break if n > max_variants
+      candidate = "#{bare_name}_v#{n}"
+      if _audio_exists?(candidate)
+        variants << candidate
+        n += 1
+      else
+        break
+      end
+    end
+
+    log("  _find_variants(#{bare_name}) => #{variants.length} file(s)")
+    variants
+  end
+
   # Play a single audio file (bare_name is relative to Audio/SE/).
   # Stops any currently playing SE first.
   #
@@ -236,6 +271,7 @@ module PokedexVoiceOver
   #
   # For fused Pokémon:
   #   1. If a dedicated fusion audio file exists, play it directly.
+  #      If variant files exist (_v2, _v3…), one is chosen at random.
   #   2. Otherwise, if both base-species files exist, play them sequentially
   #      in a background thread (head first, then body after the head
   #      finishes — timed using the dex_durations.json manifest).
@@ -244,8 +280,6 @@ module PokedexVoiceOver
   def self.play(species, fused_species = nil)
     log("play() called — enabled=#{enabled?}, species=#{species.inspect}, fused=#{fused_species.inspect}")
     return unless enabled?
-
-    _save_and_mute_bgm
 
     base = species_str(species)
     log("  base species_str => #{base.inspect}")
@@ -261,11 +295,15 @@ module PokedexVoiceOver
     if fused
       fusion_bare = "#{AUDIO_SUBDIR}/dex_#{base}_#{fused}"
 
-      if _audio_exists?(fusion_bare)
-        # Dedicated fusion file — play it directly
-        log("  Playing dedicated fusion audio: #{fusion_bare}")
+      # Check for the primary fusion file and any variants
+      fusion_variants = _find_variants(fusion_bare)
+
+      if fusion_variants.any?
+        # Pick a random variant (or the single file if only one exists)
+        chosen = fusion_variants.sample
+        log("  Playing fusion audio: #{chosen} (from #{fusion_variants.length} variant(s))")
         begin
-          _play_bare(fusion_bare)
+          _play_bare(chosen)
         rescue StandardError => e
           log("  Fusion playback error: #{e.class}: #{e.message}")
         end
@@ -302,7 +340,6 @@ module PokedexVoiceOver
                     sleep(step)
                     elapsed2 += step
                   end
-                  PokedexVoiceOver._restore_bgm if @playback_gen == my_gen
                 end
               rescue StandardError => e
                 PokedexVoiceOver.log("  Sequential playback error: #{e.class}: #{e.message}")
@@ -317,14 +354,19 @@ module PokedexVoiceOver
       end
     else
       bare = "#{AUDIO_SUBDIR}/dex_#{base}"
-      unless _audio_exists?(bare)
+
+      # Check for the primary file and any variants
+      variants = _find_variants(bare)
+      if variants.empty?
         log("  No audio file found — skipping")
         return
       end
 
-      log("  Playing single species audio: #{bare}")
+      # Pick a random variant (or the single file if only one exists)
+      chosen = variants.sample
+      log("  Playing species audio: #{chosen} (from #{variants.length} variant(s))")
       begin
-        _play_bare(bare)
+        _play_bare(chosen)
       rescue StandardError => e
         log("  Playback error: #{e.class}: #{e.message}")
       end
@@ -333,6 +375,8 @@ module PokedexVoiceOver
 
   # Stop any playing voice-over, including any pending sequential playback.
   # Bumping @playback_gen causes any running playback thread to exit cleanly.
+  # NOTE: BGM is now managed by the scene hooks (muted on open, restored on
+  # close), so stop only handles SE playback.
   def self.stop
     @playback_gen = (@playback_gen || 0) + 1
     begin
@@ -340,7 +384,6 @@ module PokedexVoiceOver
     rescue StandardError => e
       log("stop error: #{e.class}: #{e.message}")
     end
-    _restore_bgm
   end
 end
 
@@ -354,6 +397,16 @@ end
 #
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
+#
+# KNOWN BUG FIXES (v1.4.0)
+# -------------------------
+# - Music is now muted as soon as the Pokédex scene opens (regardless of
+#   which page is shown) and restored when the scene closes.  Previously
+#   music was only muted when a voice-over played on the entry page.
+# - Fused Pokémon with multiple Pokédex entries are now supported.  The mod
+#   detects variant audio files (dex_SP1_SP2_v2.ogg, _v3.ogg, …) and
+#   randomly selects one each time — matching the game's behaviour of
+#   choosing a random entry for fusions.
 #
 # KNOWN BUG FIXES (v1.3.0)
 # -------------------------
@@ -497,6 +550,9 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbStartScene(*args)
         dex_vo_orig_pbStartScene(*args)
 
+        # Always mute BGM when the Pokédex scene opens, regardless of page.
+        PokedexVoiceOver.save_and_mute_bgm
+
         # NOTE: @page is nil (not an error) if the original method hasn't
         # set it yet.  In Ruby, accessing an undefined ivar returns nil —
         # it does NOT raise, so `rescue` never triggers.  We treat nil as
@@ -578,6 +634,7 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbEndScene(*args)
         PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
+        PokedexVoiceOver.restore_bgm
         dex_vo_orig_pbEndScene(*args)
       end
     else
@@ -609,53 +666,134 @@ PokedexVoiceOver.log("Mod loading finished")
 PokedexVoiceOver.log("=" * 60)
 
 # =============================================================================
-# Mod Settings menu registration (Stonewall's Mod Settings mod)
+# Mod Settings submenu scene (Stonewall's Mod Settings mod)
 # =============================================================================
-# Registers all settings under the "Interface" category so they appear in
-# the in-game Mod Settings menu (Options > Mod Settings).
+# Creates a dedicated Pokédex Voice Over settings submenu that opens when the
+# user clicks the "Pokédex Voice Over" entry under the Interface category.
+#
+# Follows the same submenu pattern used by the Economy Mod and other KIF mods.
+# See: https://github.com/Stonewallx/KIF-Mods/blob/main/Documentation/Mod%20Settings.md
+
+class PokedexVoiceOverSettingsScene < PokemonOption_Scene
+  include ModSettingsSpacing if defined?(ModSettingsSpacing)
+
+  # Skip fade-in to avoid double-fade (outer pbFadeOutIn handles the transition)
+  def pbFadeInAndShow(sprites, visiblesprites = nil)
+    if visiblesprites
+      visiblesprites.each { |s| sprites[s].visible = true }
+    else
+      sprites.each { |key, sprite| sprite.visible = true if sprite }
+    end
+  end
+
+  def pbGetOptions(inloadscreen = false)
+    options = []
+
+    options << EnumOption.new(
+      _INTL("Enable Voice Over"),
+      [_INTL("Off"), _INTL("On")],
+      proc { ModSettingsMenu.get(:pokedex_vo_enabled) || 0 },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_enabled, value) },
+      _INTL("Enable or disable Pokédex voice-over narration")
+    )
+
+    options << StoneSliderOption.new(
+      _INTL("Voice Volume"),
+      0, 100, 5,
+      proc { ModSettingsMenu.get(:pokedex_vo_volume) || 80 },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_volume, value) },
+      _INTL("Adjust the volume of the Pokédex voice-over narration")
+    )
+
+    options << EnumOption.new(
+      _INTL("Mute Music in Pokédex"),
+      [_INTL("Off"), _INTL("On")],
+      proc { ModSettingsMenu.get(:pokedex_vo_mute_music) || 0 },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_mute_music, value) },
+      _INTL("Mute background music while the Pokédex is open")
+    )
+
+    options << EnumOption.new(
+      _INTL("Re-read on Page Return"),
+      [_INTL("Off"), _INTL("On")],
+      proc { ModSettingsMenu.get(:pokedex_vo_replay_on_page_change) || 0 },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, value) },
+      _INTL("Replay the voice-over when navigating back to the description page")
+    )
+
+    options = auto_insert_spacers(options) if defined?(ModSettingsSpacing) && respond_to?(:auto_insert_spacers)
+    return options
+  end
+
+  def pbStartScene(inloadscreen = false)
+    super
+
+    # Set custom title
+    @sprites["title"] = Window_UnformattedTextPokemon.newWithSize(
+      _INTL("Pokédex Voice Over"), 0, 0, Graphics.width, 64, @viewport)
+
+    # Apply current color theme and modsettings_menu flag
+    if @sprites["option"]
+      @sprites["option"].modsettings_menu = true if @sprites["option"].respond_to?(:modsettings_menu=)
+
+      if defined?(ModSettingsMenu) && defined?(COLOR_THEMES)
+        theme_index = ModSettingsMenu.get(:modsettings_color_theme) || 0
+        theme_key = COLOR_THEMES.keys[theme_index]
+        if theme_key
+          theme = COLOR_THEMES[theme_key]
+          if theme[:base] && theme[:shadow]
+            @sprites["option"].nameBaseColor = theme[:base]
+            @sprites["option"].nameShadowColor = theme[:shadow]
+            @sprites["option"].selBaseColor = theme[:base]
+            @sprites["option"].selShadowColor = theme[:shadow]
+          end
+        end
+      end
+    end
+
+    # Initialize values
+    for i in 0...@PokemonOptions.length
+      @sprites["option"][i] = (@PokemonOptions[i].get || 0)
+    end
+    @sprites["option"].refresh
+
+    pbFadeInAndShow(@sprites) { pbUpdate }
+  end
+end
+
+# =============================================================================
+# Mod Settings menu registration
+# =============================================================================
+# Registers a single "Pokédex Voice Over" button under the Interface category
+# that opens the dedicated submenu scene above.
 #
 # When the Mod Settings system has already loaded, we register immediately.
 # Otherwise we queue the registrations via $MOD_SETTINGS_PENDING_REGISTRATIONS
 # so they are picked up once the Mod Settings system initialises later.
-# This handles the common case where this mod's script runs before the Mod
-# Settings mod has been loaded.
-#
-# See: https://github.com/Stonewallx/KIF-Mods/blob/main/Documentation/Mod%20Settings.md
 
 pokedex_vo_register_settings = proc {
-  ModSettingsMenu.register(:pokedex_vo_enabled, {
+  # Ensure default values are initialised in storage
+  ModSettingsMenu.set(:pokedex_vo_enabled, 1) if ModSettingsMenu.get(:pokedex_vo_enabled).nil?
+  ModSettingsMenu.set(:pokedex_vo_volume, 80) if ModSettingsMenu.get(:pokedex_vo_volume).nil?
+  ModSettingsMenu.set(:pokedex_vo_mute_music, 1) if ModSettingsMenu.get(:pokedex_vo_mute_music).nil?
+  ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, 0) if ModSettingsMenu.get(:pokedex_vo_replay_on_page_change).nil?
+
+  ModSettingsMenu.register(:pokedex_vo_submenu, {
     name: "Pokédex Voice Over",
-    type: :toggle,
-    description: "Enable or disable Pokédex voice-over narration",
-    default: 1,
-    category: "Interface"
-  })
-
-  ModSettingsMenu.register(:pokedex_vo_volume, {
-    name: "Voice Over Volume",
-    type: :slider,
-    min: 0,
-    max: 100,
-    interval: 5,
-    default: 80,
-    description: "Adjust the volume of the Pokédex voice-over narration",
-    category: "Interface"
-  })
-
-  ModSettingsMenu.register(:pokedex_vo_mute_music, {
-    name: "Mute Music During Voice Over",
-    type: :toggle,
-    description: "Automatically mute game music while the Pokédex voice-over plays",
-    default: 1,
-    category: "Interface"
-  })
-
-  ModSettingsMenu.register(:pokedex_vo_replay_on_page_change, {
-    name: "Re-read on Page Return",
-    type: :toggle,
-    description: "Replay the voice-over when navigating back to the description page",
-    default: 0,
-    category: "Interface"
+    type: :button,
+    description: "Configure Pokédex voice-over settings",
+    on_press: proc {
+      pbFadeOutIn {
+        scene = PokedexVoiceOverSettingsScene.new
+        screen = PokemonOptionScreen.new(scene)
+        screen.pbStartScreen
+      }
+    },
+    category: "Interface",
+    searchable: [
+      "voice over", "pokedex", "volume", "mute music", "narration",
+      "dexter", "voice", "audio", "re-read", "page change"
+    ]
   })
 }
 
