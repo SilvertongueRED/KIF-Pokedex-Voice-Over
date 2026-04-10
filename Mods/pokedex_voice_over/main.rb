@@ -43,6 +43,10 @@ module PokedexVoiceOver
   # entry for a given file.  5 seconds covers most Pokédex entries comfortably.
   SEQUENTIAL_DURATION_FALLBACK = 5.0
 
+  # Delay (seconds) before voice-over playback begins, allowing the Pokémon's
+  # cry to finish before the Pokédex entry is read aloud.
+  CRY_DELAY = 1.0
+
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
 
@@ -291,85 +295,77 @@ module PokedexVoiceOver
     # Advance the generation counter to invalidate any in-progress sequential
     # playback thread without forcibly killing it.
     @playback_gen = (@playback_gen || 0) + 1
+    my_gen = @playback_gen  # snapshot so the thread can self-cancel
 
-    if fused
-      fusion_bare = "#{AUDIO_SUBDIR}/dex_#{base}_#{fused}"
-
-      # Check for the primary fusion file and any variants
-      fusion_variants = _find_variants(fusion_bare)
-
-      if fusion_variants.any?
-        # Pick a random variant (or the single file if only one exists)
-        chosen = fusion_variants.sample
-        log("  Playing fusion audio: #{chosen} (from #{fusion_variants.length} variant(s))")
+    # All playback goes through a background thread so the CRY_DELAY and any
+    # sequential waits never freeze the game loop.
+    begin
+      Thread.new do
         begin
-          _play_bare(chosen)
-        rescue StandardError => e
-          log("  Fusion playback error: #{e.class}: #{e.message}")
-        end
-      else
-        # No custom fusion entry — fall back to sequential base-species playback
-        bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
-        bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
+          # Wait for the Pokémon's cry to finish before reading the entry.
+          _interruptible_sleep(CRY_DELAY, my_gen)
+          next if @playback_gen != my_gen
 
-        if _audio_exists?(bare_head) && _audio_exists?(bare_body)
-          log("  Playing sequential: #{bare_head} then #{bare_body}")
-          head_duration = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
-          body_duration = (durations["dex_#{fused}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
-          vol = volume        # capture for thread closure
-          my_gen = @playback_gen  # snapshot so the thread can self-cancel
-          begin
-            Audio.se_stop
-            Thread.new do
-              begin
-                Audio.se_play(bare_head, vol, 100)
-                # Sleep in small increments so we respond promptly to new
-                # play/stop calls (which bump @playback_gen).
-                elapsed = 0.0
-                step = 0.1
-                while elapsed < head_duration
-                  break if @playback_gen != my_gen
-                  sleep(step)
-                  elapsed += step
-                end
+          if fused
+            fusion_bare = "#{AUDIO_SUBDIR}/dex_#{base}_#{fused}"
+
+            # Check for the primary fusion file and any variants
+            fusion_variants = _find_variants(fusion_bare)
+
+            if fusion_variants.any?
+              chosen = fusion_variants.sample
+              log("  Playing fusion audio: #{chosen} (from #{fusion_variants.length} variant(s))")
+              _play_bare(chosen)
+            else
+              # No custom fusion entry — fall back to sequential base-species playback
+              bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
+              bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
+
+              if _audio_exists?(bare_head) && _audio_exists?(bare_body)
+                log("  Playing sequential: #{bare_head} then #{bare_body}")
+                head_duration = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+                Audio.se_stop
+                Audio.se_play(bare_head, volume, 100)
+                _interruptible_sleep(head_duration, my_gen)
                 if @playback_gen == my_gen
-                  Audio.se_play(bare_body, vol, 100)
-                  elapsed2 = 0.0
-                  while elapsed2 < body_duration
-                    break if @playback_gen != my_gen
-                    sleep(step)
-                    elapsed2 += step
-                  end
+                  Audio.se_play(bare_body, volume, 100)
                 end
-              rescue StandardError => e
-                PokedexVoiceOver.log("  Sequential playback error: #{e.class}: #{e.message}")
+              else
+                log("  No fusion or sequential audio available — skipping")
               end
             end
-          rescue StandardError => e
-            log("  Thread creation error: #{e.class}: #{e.message}")
+          else
+            bare = "#{AUDIO_SUBDIR}/dex_#{base}"
+
+            # Check for the primary file and any variants
+            variants = _find_variants(bare)
+            if variants.empty?
+              log("  No audio file found — skipping")
+              next
+            end
+
+            chosen = variants.sample
+            log("  Playing species audio: #{chosen} (from #{variants.length} variant(s))")
+            _play_bare(chosen)
           end
-        else
-          log("  No fusion or sequential audio available — skipping")
+        rescue StandardError => e
+          PokedexVoiceOver.log("  Playback thread error: #{e.class}: #{e.message}")
         end
       end
-    else
-      bare = "#{AUDIO_SUBDIR}/dex_#{base}"
+    rescue StandardError => e
+      log("  Thread creation error: #{e.class}: #{e.message}")
+    end
+  end
 
-      # Check for the primary file and any variants
-      variants = _find_variants(bare)
-      if variants.empty?
-        log("  No audio file found — skipping")
-        return
-      end
-
-      # Pick a random variant (or the single file if only one exists)
-      chosen = variants.sample
-      log("  Playing species audio: #{chosen} (from #{variants.length} variant(s))")
-      begin
-        _play_bare(chosen)
-      rescue StandardError => e
-        log("  Playback error: #{e.class}: #{e.message}")
-      end
+  # Sleep in small increments so we respond promptly to new play/stop calls
+  # (which bump @playback_gen).  Returns early if the generation changes.
+  def self._interruptible_sleep(duration, gen)
+    elapsed = 0.0
+    step = 0.1
+    while elapsed < duration
+      break if @playback_gen != gen
+      sleep(step)
+      elapsed += step
     end
   end
 
@@ -397,6 +393,14 @@ end
 #
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
+#
+# KNOWN BUG FIXES (v1.5.0)
+# -------------------------
+# - BGM is now muted as soon as the Pokédex *menu* opens (PokemonPokedex_Scene)
+#   rather than when opening an individual entry.  Music resumes only when
+#   closing the Pokédex menu completely.
+# - A 1-second delay is now applied before the voice-over plays, so the
+#   Pokémon's cry is heard first before the Pokédex entry audio begins.
 #
 # KNOWN BUG FIXES (v1.4.0)
 # -------------------------
@@ -550,9 +554,6 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbStartScene(*args)
         dex_vo_orig_pbStartScene(*args)
 
-        # Always mute BGM when the Pokédex scene opens, regardless of page.
-        PokedexVoiceOver.save_and_mute_bgm
-
         # NOTE: @page is nil (not an error) if the original method hasn't
         # set it yet.  In Ruby, accessing an undefined ivar returns nil —
         # it does NOT raise, so `rescue` never triggers.  We treat nil as
@@ -634,7 +635,6 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbEndScene(*args)
         PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
-        PokedexVoiceOver.restore_bgm
         dex_vo_orig_pbEndScene(*args)
       end
     else
@@ -659,6 +659,76 @@ else
     end
   rescue StandardError => e
     PokedexVoiceOver.log("  ObjectSpace scan failed: #{e.message}")
+  end
+end
+
+# =============================================================================
+# Hook into PokemonPokedex_Scene (the Pokédex list / menu)
+# =============================================================================
+# Mute BGM as soon as the player opens the Pokédex menu (not just when viewing
+# an individual entry) and restore it when the menu is closed completely.
+
+PokedexVoiceOver.log("  defined?(PokemonPokedex_Scene) = #{defined?(PokemonPokedex_Scene).inspect}")
+
+if defined?(PokemonPokedex_Scene)
+  PokedexVoiceOver.log("  PokemonPokedex_Scene exists — installing BGM hooks")
+
+  class PokemonPokedex_Scene
+    if method_defined?(:pbStartScene)
+      PokedexVoiceOver.log("  Aliasing PokemonPokedex_Scene#pbStartScene")
+      alias dex_vo_orig_list_pbStartScene pbStartScene
+
+      def pbStartScene(*args)
+        dex_vo_orig_list_pbStartScene(*args)
+        PokedexVoiceOver.log("PokemonPokedex_Scene#pbStartScene fired — muting BGM")
+        PokedexVoiceOver.save_and_mute_bgm
+      end
+    else
+      PokedexVoiceOver.log("  WARNING: PokemonPokedex_Scene#pbStartScene is NOT defined")
+    end
+
+    if method_defined?(:pbEndScene)
+      PokedexVoiceOver.log("  Aliasing PokemonPokedex_Scene#pbEndScene")
+      alias dex_vo_orig_list_pbEndScene pbEndScene
+
+      def pbEndScene(*args)
+        PokedexVoiceOver.log("PokemonPokedex_Scene#pbEndScene fired — restoring BGM")
+        PokedexVoiceOver.stop
+        PokedexVoiceOver.restore_bgm
+        dex_vo_orig_list_pbEndScene(*args)
+      end
+    else
+      PokedexVoiceOver.log("  WARNING: PokemonPokedex_Scene#pbEndScene is NOT defined")
+    end
+  end
+
+  PokedexVoiceOver.log("  PokemonPokedex_Scene BGM hooks installed")
+else
+  PokedexVoiceOver.log("  WARNING: PokemonPokedex_Scene is NOT defined — BGM will be muted/restored per-entry instead")
+
+  # Fallback: if the list scene class doesn't exist, keep BGM management in
+  # PokemonPokedexInfo_Scene so the feature still works (just scoped to entries).
+  if defined?(PokemonPokedexInfo_Scene)
+    class PokemonPokedexInfo_Scene
+      if method_defined?(:dex_vo_orig_pbStartScene) && !method_defined?(:dex_vo_fallback_bgm_start)
+        alias dex_vo_fallback_bgm_start pbStartScene
+
+        def pbStartScene(*args)
+          PokedexVoiceOver.save_and_mute_bgm
+          dex_vo_fallback_bgm_start(*args)
+        end
+      end
+
+      if method_defined?(:dex_vo_orig_pbEndScene) && !method_defined?(:dex_vo_fallback_bgm_end)
+        alias dex_vo_fallback_bgm_end pbEndScene
+
+        def pbEndScene(*args)
+          PokedexVoiceOver.restore_bgm
+          dex_vo_fallback_bgm_end(*args)
+        end
+      end
+    end
+    PokedexVoiceOver.log("  Fallback: BGM hooks added to PokemonPokedexInfo_Scene")
   end
 end
 
