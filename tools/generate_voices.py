@@ -400,26 +400,31 @@ def build_species_id_map(species_dat: Path) -> dict:
     return id_map
 
 
-def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> dict:
+def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> tuple[dict, dict]:
     """
-    Parse KIF's ``Data/pokedex/dex.json`` and return a
-    ``{(SPECIES1, SPECIES2): entry_text}`` dict for fusion Pokémon.
+    Parse KIF's ``Data/pokedex/dex.json`` and return two dicts:
+
+    1. ``{(SPECIES1, SPECIES2): entry_text}`` — primary (first) entry per pair
+    2. ``{(SPECIES1, SPECIES2): [entry_text, ...]}`` — variant entries (2nd, 3rd, …)
 
     *id_map* must be a ``{dex_number: SPECIES_NAME}`` mapping (from
     :func:`build_species_id_map`).
     """
-    fusion_entries: dict = {}
+    primary_entries: dict = {}
+    variant_entries: dict = {}
+    all_per_pair: dict = {}  # accumulates all entries per pair
+
     dex_json = game_dir / "Data" / "pokedex" / "dex.json"
 
     if not dex_json.is_file():
-        return fusion_entries
+        return primary_entries, variant_entries
 
     try:
         content = dex_json.read_text(encoding="utf-8", errors="replace")
         records = json.loads(content)
     except (OSError, json.JSONDecodeError) as exc:
         log.warning("Cannot read %s: %s", dex_json, exc)
-        return fusion_entries
+        return primary_entries, variant_entries
 
     for rec in records:
         sprite = rec.get("sprite", "")
@@ -449,13 +454,27 @@ def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> dict:
             continue
 
         pair = (head_name, body_name)
-        # Keep the first entry for each pair (skip duplicates)
-        if pair not in fusion_entries:
-            fusion_entries[pair] = entry_text
+        # Collect all unique entries per pair
+        if pair not in all_per_pair:
+            all_per_pair[pair] = []
+        if entry_text not in all_per_pair[pair]:
+            all_per_pair[pair].append(entry_text)
 
-    if fusion_entries:
-        log.info("Parsed %d fusion entries from %s", len(fusion_entries), dex_json.name)
-    return fusion_entries
+    # Split into primary (first entry) and variants (subsequent entries)
+    for pair, texts in all_per_pair.items():
+        primary_entries[pair] = texts[0]
+        if len(texts) > 1:
+            variant_entries[pair] = texts[1:]
+
+    if primary_entries:
+        log.info("Parsed %d fusion entries from %s", len(primary_entries), dex_json.name)
+    if variant_entries:
+        variant_count = sum(len(v) for v in variant_entries.values())
+        log.info(
+            "Found %d additional variant entries across %d fusion pairs",
+            variant_count, len(variant_entries),
+        )
+    return primary_entries, variant_entries
 
 
 # ---------------------------------------------------------------------------
@@ -1329,9 +1348,10 @@ def main(argv=None) -> int:
 
     # ---- build fusion entry map (needed even for --retry-failed) ------------
     fusion_entries: dict = {}
+    fusion_variant_entries: dict = {}  # {(SP1, SP2): [text2, text3, …]}
     if args.fusions:
         if species_id_map:
-            fusion_entries = parse_kif_fusion_json(game_dir, species_id_map)
+            fusion_entries, fusion_variant_entries = parse_kif_fusion_json(game_dir, species_id_map)
         if not fusion_entries:
             fusion_entries = parse_fusion_entries(game_dir)
         if not fusion_entries and not args.retry_failed:
@@ -1343,7 +1363,12 @@ def main(argv=None) -> int:
 
     # ---- build a lookup: filename → (text, dest) for retry mode ------------
     def _all_pending_entries() -> list[tuple[str, str, Path]]:
-        """Return list of (filename, text, dest) for all entries to process."""
+        """Return list of (filename, text, dest) for all entries to process.
+
+        Includes primary fusion entries and any variant entries (named with
+        a ``_v2``, ``_v3``, … suffix).  Variant files are generated alongside
+        primary files but never overwrite them.
+        """
         items = []
         for species_name, entry_text in sorted(all_entries.items()):
             dest = output_dir / f"dex_{species_name}.ogg"
@@ -1352,6 +1377,11 @@ def main(argv=None) -> int:
             for (sp1, sp2), entry_text in sorted(fusion_entries.items()):
                 dest = output_dir / f"dex_{sp1}_{sp2}.ogg"
                 items.append((dest.name, entry_text, dest))
+            # Variant entries for fusions with multiple dex descriptions
+            for (sp1, sp2), variant_texts in sorted(fusion_variant_entries.items()):
+                for idx, vtext in enumerate(variant_texts, start=2):
+                    dest = output_dir / f"dex_{sp1}_{sp2}_v{idx}.ogg"
+                    items.append((dest.name, vtext, dest))
         return items
 
     # ---- determine which entries to attempt ---------------------------------
