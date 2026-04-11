@@ -50,7 +50,7 @@ module PokedexVoiceOver
 
   # Delay (seconds) before voice-over playback begins, allowing the Pokémon's
   # cry to finish before the Pokédex entry is read aloud.
-  CRY_DELAY = 1.0
+  CRY_DELAY = 0.3
 
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
@@ -373,7 +373,9 @@ module PokedexVoiceOver
   # then falls back to the full "Audio/SE/" prefixed path in case the engine
   # needs it (some MKXP builds behave differently).
   def self._play_bare(bare_name)
-    Audio.se_stop
+    # REMOVED: Audio.se_stop — the generation counter in play() already handles
+    # cancelling previous playback. Calling se_stop here kills audio from the
+    # current generation's own play attempt when multiple threads race.
     log("  _play_bare: Audio.se_play('#{bare_name}', #{volume}, 100)")
     begin
       Audio.se_play(bare_name, volume, 100)
@@ -1184,11 +1186,17 @@ if defined?(PokemonPokedexInfo_Scene)
 
         if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
-          @dex_vo_last_species = [head, fused]
-          # Defer playback to drawPage/pbShowPage where @randomEntryText
-          # will have been updated by drawEntryText.
-          @dex_vo_pending_play = true
-          PokedexVoiceOver.log("  Deferred playback — @dex_vo_pending_play set")
+          current_species = [head, fused]
+          if @dex_vo_last_species == current_species
+            # drawPage already fired and played for this species — don't double-play
+            PokedexVoiceOver.log("  drawPage already played for #{current_species.inspect} — skipping deferred playback")
+          else
+            @dex_vo_last_species = current_species
+            # Defer playback to drawPage/pbShowPage where @randomEntryText
+            # will have been updated by drawEntryText.
+            @dex_vo_pending_play = true
+            PokedexVoiceOver.log("  Deferred playback — @dex_vo_pending_play set")
+          end
         else
           PokedexVoiceOver.log("  Skipping — page #{page} is not the entry page (#{POKEDEX_VO_ENTRY_PAGE})")
           PokedexVoiceOver.log("  Hint: if the voice should play here, set POKEDEX_VO_ENTRY_PAGE = #{page}")
@@ -1230,6 +1238,7 @@ if defined?(PokemonPokedexInfo_Scene)
           elsif species_changed
             PokedexVoiceOver.log("  pbShowPage: species changed — playing")
             @dex_vo_last_species = current_species
+            @dex_vo_pending_play = false  # clear pending flag to prevent double-play
             text = pokedex_vo_displayed_text(true)
             PokedexVoiceOver.play(head, fused, text)
             @dex_vo_last_displayed_text = text
@@ -1274,6 +1283,7 @@ if defined?(PokemonPokedexInfo_Scene)
             elsif species_changed
               PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
               @dex_vo_last_species = current_species
+              @dex_vo_pending_play = false  # clear pending flag to prevent double-play
               text = pokedex_vo_displayed_text(true)
               PokedexVoiceOver.play(head, fused, text)
               @dex_vo_last_displayed_text = text
