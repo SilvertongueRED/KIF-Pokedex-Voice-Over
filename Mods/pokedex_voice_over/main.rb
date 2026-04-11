@@ -867,10 +867,9 @@ if defined?(PokemonPokedexInfo_Scene)
 
       # Strategy 1.5: @randomEntryText (KIF stores randomly-chosen fusion entry text here)
       # KIF's drawEntryText sets @randomEntryText to the text it actually displays
-      # for generated fusion entries.  This is the most reliable source for fusion
-      # text, but may be stale after navigation (still holding the previous species'
-      # text) because our hooks fire before drawEntryText runs.  Cross-check against
-      # the current species to avoid reading stale data.
+      # for generated fusion entries.  After navigation, the game sets this to nil
+      # before drawEntryText re-assigns it, so a nil value here simply means the
+      # text hasn't been set yet — the nil/length guard below handles that case.
       if text.nil? && instance_variable_defined?(:@randomEntryText)
         val = instance_variable_get(:@randomEntryText)
         if val.is_a?(String) && val.strip.length > 10
