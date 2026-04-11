@@ -859,7 +859,7 @@ if defined?(PokemonPokedexInfo_Scene)
     #   3.   Instance variable scan (may be stale after navigation)
     #   4.   GameData lookups
     #   5.   pbGetMessage fallback
-    def pokedex_vo_displayed_text
+    def pokedex_vo_displayed_text(skip_stale_check = false)
       text = nil
 
       # Strategy 1: @dummyPokemon (most reliable — refreshed each navigation)
@@ -891,8 +891,12 @@ if defined?(PokemonPokedexInfo_Scene)
       if text.nil? && instance_variable_defined?(:@randomEntryText)
         val = instance_variable_get(:@randomEntryText)
         if val.is_a?(String) && val.strip.length > 10
-          text = val
-          PokedexVoiceOver.log("  Displayed text found via @randomEntryText")
+          if skip_stale_check && val == @dex_vo_last_displayed_text
+            PokedexVoiceOver.log("  @randomEntryText matches last displayed text — skipping (possibly stale)")
+          else
+            text = val
+            PokedexVoiceOver.log("  Displayed text found via @randomEntryText")
+          end
         end
       end
 
@@ -1168,6 +1172,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
       def pbStartScene(*args)
         dex_vo_orig_pbStartScene(*args)
+        @dex_vo_last_displayed_text = nil
 
         # NOTE: @page is nil (not an error) if the original method hasn't
         # set it yet.  In Ruby, accessing an undefined ivar returns nil —
@@ -1214,20 +1219,24 @@ if defined?(PokemonPokedexInfo_Scene)
 
           if @dex_vo_pending_play
             # Deferred playback from pbStartScene or navigation hooks.
-            # @randomEntryText is now fresh because drawEntryText has run.
+            # @randomEntryText may be stale — use skip_stale_check to fall
+            # through to fresher text detection strategies when needed.
             PokedexVoiceOver.log("  pbShowPage: pending play flag set — playing with fresh text")
             @dex_vo_last_species = current_species
             @dex_vo_pending_play = false
-            text = pokedex_vo_displayed_text
+            text = pokedex_vo_displayed_text(true)
             PokedexVoiceOver.play(head, fused, text)
+            @dex_vo_last_displayed_text = text
           elsif species_changed
             PokedexVoiceOver.log("  pbShowPage: species changed — playing")
             @dex_vo_last_species = current_species
-            text = pokedex_vo_displayed_text
+            text = pokedex_vo_displayed_text(true)
             PokedexVoiceOver.play(head, fused, text)
+            @dex_vo_last_displayed_text = text
           elsif page_changed && PokedexVoiceOver.play_on_page_change?
             text = pokedex_vo_displayed_text
             PokedexVoiceOver.play(head, fused, text)
+            @dex_vo_last_displayed_text = text
           end
         end
       end
@@ -1254,21 +1263,25 @@ if defined?(PokemonPokedexInfo_Scene)
 
             if @dex_vo_pending_play
               # Deferred playback from pbStartScene or navigation hooks.
-              # @randomEntryText is now fresh because drawEntryText has run.
+              # @randomEntryText may be stale — use skip_stale_check to fall
+              # through to fresher text detection strategies when needed.
               PokedexVoiceOver.log("  drawPage: pending play flag set — playing with fresh text")
               @dex_vo_last_species = current_species
               @dex_vo_pending_play = false
-              text = pokedex_vo_displayed_text
+              text = pokedex_vo_displayed_text(true)
               PokedexVoiceOver.play(head, fused, text)
+              @dex_vo_last_displayed_text = text
             elsif species_changed
               PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
               @dex_vo_last_species = current_species
-              text = pokedex_vo_displayed_text
+              text = pokedex_vo_displayed_text(true)
               PokedexVoiceOver.play(head, fused, text)
+              @dex_vo_last_displayed_text = text
             elsif page_changed && PokedexVoiceOver.play_on_page_change?
               PokedexVoiceOver.log("  drawPage: page changed to entry page — replaying")
               text = pokedex_vo_displayed_text
               PokedexVoiceOver.play(head, fused, text)
+              @dex_vo_last_displayed_text = text
             end
           end
         end
@@ -1287,6 +1300,7 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbEndScene(*args)
         PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
+        @dex_vo_last_displayed_text = nil
         dex_vo_orig_pbEndScene(*args)
       end
     else
