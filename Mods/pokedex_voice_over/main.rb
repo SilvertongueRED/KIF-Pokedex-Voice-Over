@@ -414,6 +414,47 @@ module PokedexVoiceOver
       end
     end
 
+    # Try substring/contains match — the displayed text may be a substring
+    # of the entry map value, or vice versa (e.g. truncated fusion entries).
+    variants.each do |variant_bare|
+      stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+      map_text = entry_map[stem]
+      next unless map_text
+      norm_map = _normalize_text(map_text)
+      next if norm_map.empty?
+      if norm_map.include?(norm_displayed) || norm_displayed.include?(norm_map)
+        log("  _match_variant: substring match => #{variant_bare}")
+        return variant_bare
+      end
+    end
+
+    # Word-overlap fallback — compare significant words (4+ chars) between
+    # the displayed text and each entry map value.  Pick the variant with
+    # the highest overlap ratio.
+    displayed_words = norm_displayed.split(" ").select { |w| w.length >= 4 }.uniq
+    if displayed_words.length >= 3
+      best_variant = nil
+      best_ratio = 0.0
+      variants.each do |variant_bare|
+        stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+        map_text = entry_map[stem]
+        next unless map_text
+        norm_map = _normalize_text(map_text)
+        map_words = norm_map.split(" ").select { |w| w.length >= 4 }.uniq
+        next if map_words.empty?
+        common = (displayed_words & map_words).length
+        ratio = common.to_f / [displayed_words.length, map_words.length].max
+        if ratio > best_ratio
+          best_ratio = ratio
+          best_variant = variant_bare
+        end
+      end
+      if best_variant && best_ratio >= 0.5
+        log("  _match_variant: word-overlap match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
+        return best_variant
+      end
+    end
+
     log("  _match_variant: no match found")
     nil
   end
@@ -769,6 +810,14 @@ if defined?(PokemonPokedexInfo_Scene)
 
   class PokemonPokedexInfo_Scene
     POKEDEX_VO_ENTRY_PAGE = 1   # page index that shows the Pokédex description (KIF uses 1-based pages)
+
+    # Helper: clear cached entry text ivars so KIF's drawEntryText
+    # regenerates @randomEntryText for the new species/fusion.
+    def dex_vo_clear_entry_text_caches
+      @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
+      @entryText = nil if instance_variable_defined?(:@entryText)
+      @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+    end
 
     # Helper: read the current species + fusion partner from scene state.
     #
@@ -1293,6 +1342,19 @@ if defined?(PokemonPokedexInfo_Scene)
 
       def pbShowPage(page, *args)
         prev_page = @page  # nil if not yet set (see note in pbStartScene)
+
+        # Clear cached entry text when the species changes so KIF's
+        # drawEntryText (called inside dex_vo_orig_pbShowPage) regenerates
+        # @randomEntryText for the new fusion instead of reusing the old one.
+        if page == POKEDEX_VO_ENTRY_PAGE && instance_variable_defined?(:@index) && @index
+          current_entry = @dexlist.is_a?(Array) && @index < @dexlist.length ? @dexlist[@index] : nil
+          if current_entry && current_entry != @dex_vo_prev_drawn_entry
+            @dex_vo_prev_drawn_entry = current_entry
+            dex_vo_clear_entry_text_caches
+            PokedexVoiceOver.log("  pbShowPage: species entry changed — cleared @randomEntryText and related caches")
+          end
+        end
+
         dex_vo_orig_pbShowPage(page, *args)
 
         PokedexVoiceOver.log("pbShowPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
@@ -1334,6 +1396,19 @@ if defined?(PokemonPokedexInfo_Scene)
 
         def drawPage(page, *args)
           prev_page = @page  # capture before the original method updates it
+
+          # Clear cached entry text when the species changes so KIF's
+          # drawEntryText (called inside dex_vo_orig_drawPage) regenerates
+          # @randomEntryText for the new fusion instead of reusing the old one.
+          if page == POKEDEX_VO_ENTRY_PAGE && instance_variable_defined?(:@index) && @index
+            current_entry = @dexlist.is_a?(Array) && @index < @dexlist.length ? @dexlist[@index] : nil
+            if current_entry && current_entry != @dex_vo_prev_drawn_entry
+              @dex_vo_prev_drawn_entry = current_entry
+              dex_vo_clear_entry_text_caches
+              PokedexVoiceOver.log("  drawPage: species entry changed — cleared @randomEntryText and related caches")
+            end
+          end
+
           dex_vo_orig_drawPage(page, *args)
 
           PokedexVoiceOver.log("drawPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
@@ -1398,6 +1473,10 @@ if defined?(PokemonPokedexInfo_Scene)
         prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToNext(*args)
 
+        # Clear cached entry text so drawPage/drawEntryText regenerates
+        # @randomEntryText for the new species instead of reusing stale text.
+        dex_vo_clear_entry_text_caches
+
         PokedexVoiceOver.log("pbGoToNext fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
         head, fused = pokedex_vo_current_species
@@ -1421,6 +1500,10 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbGoToPrevious(*args)
         prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToPrevious(*args)
+
+        # Clear cached entry text so drawPage/drawEntryText regenerates
+        # @randomEntryText for the new species instead of reusing stale text.
+        dex_vo_clear_entry_text_caches
 
         PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
