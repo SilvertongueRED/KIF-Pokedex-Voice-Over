@@ -1,7 +1,7 @@
 {
   "name": "Pokédex Voice Over",
   "id": "pokedex_voice_over",
-  "version": "1.7.0",
+  "version": "1.8.0",
   "author": "SilvertongueRED",
   "description": "Reads Pokédex entries aloud in the style of Dexter, the classic Pokémon anime Pokédex narrator, whenever you open a Pokémon's Pokédex entry — including all fused variants. Supports multiple entry variants for fusions.",
   "tags": ["Audio", "QoL", "Fusion"],
