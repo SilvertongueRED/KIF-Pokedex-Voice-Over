@@ -534,6 +534,22 @@ end
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
 #
+# KNOWN BUG FIXES (v1.10.0)
+# --------------------------
+# - KIF scene methods (getCustomDexEntry, getCustomEntryText, getAIDexEntry)
+#   now called with correct arguments (species/composite ID) instead of zero
+#   args.  Uses arity-aware fallback to try multiple argument sets.
+# - GameData composite lookup now cross-checks fusion text against the head
+#   species' base entry; discards the result when they match (indicating the
+#   lookup returned stale base-species text, not the fusion's custom entry).
+# - New @sprites overlay text extraction strategy reads displayed entry text
+#   from KIF's UI text windows when other methods fail.
+# - pbGetMessage now also tried with the composite species ID for fusions.
+# - Double playback eliminated: navigation hooks (pbGoToNext/pbGoToPrevious)
+#   and pbStartScene set flags (@dex_vo_nav_played / @dex_vo_scene_played)
+#   that drawPage/pbShowPage check and clear, preventing the second play()
+#   call that previously occurred on every navigation or scene open.
+#
 # KNOWN BUG FIXES (v1.9.0)
 # -------------------------
 # - CRY_DELAY reduced from 1.0s to 0.5s — voice reads sooner after opening.
@@ -849,25 +865,69 @@ if defined?(PokemonPokedexInfo_Scene)
       end
 
       # Strategy 2: KIF-specific scene methods (use current internal state)
+      # These methods require arguments (species ID or head/body pair).
+      # We detect the current species first, then try each method with the
+      # appropriate arguments, falling back to fewer args on ArgumentError.
       if text.nil?
+        kif_head, kif_fused = pokedex_vo_current_species
+        nb = PokedexVoiceOver.nb_pokemon
+        kif_composite = nil
+        if kif_head && kif_fused && nb && nb > 0 && kif_head.is_a?(Integer) && kif_fused.is_a?(Integer)
+          kif_composite = kif_head * nb + kif_fused
+        end
+
+        # Helper to extract a usable string from a method return value
+        _extract_text = lambda do |val|
+          if val.is_a?(String) && val.strip.length > 10
+            val
+          elsif val.is_a?(Array)
+            val.find { |v| v.is_a?(String) && v.strip.length > 10 }
+          else
+            nil
+          end
+        end
+
+        # Try each method with progressively fewer arguments until one works
         [:getCustomDexEntry, :getCustomEntryText, :getAIDexEntry].each do |method_name|
           next unless respond_to?(method_name, true)
-          begin
-            val = send(method_name)
-            if val.is_a?(String) && val.strip.length > 10
-              text = val
-              PokedexVoiceOver.log("  Displayed text found via #{method_name}()")
+          val = nil
+          called_with = nil
+
+          # Build a list of argument sets to try (most specific first)
+          arg_sets = []
+          if method_name == :getAIDexEntry
+            # getAIDexEntry expects (head, body) for fusions
+            arg_sets << [kif_head, kif_fused] if kif_head && kif_fused
+            arg_sets << [kif_composite] if kif_composite
+            arg_sets << [kif_head] if kif_head
+          else
+            # getCustomDexEntry / getCustomEntryText expect (species)
+            arg_sets << [kif_composite] if kif_composite
+            arg_sets << [kif_head] if kif_head
+          end
+          # Always try with zero args as a last resort
+          arg_sets << []
+
+          arg_sets.each do |args|
+            begin
+              val = send(method_name, *args)
+              called_with = args
               break
-            elsif val.is_a?(Array)
-              str = val.find { |v| v.is_a?(String) && v.strip.length > 10 }
-              if str
-                text = str
-                PokedexVoiceOver.log("  Displayed text found via #{method_name}() (array)")
-                break
-              end
+            rescue ArgumentError => e
+              PokedexVoiceOver.log("  #{method_name}(#{args.map(&:inspect).join(', ')}) arg error: #{e.message}")
+              val = nil
+            rescue StandardError => e
+              PokedexVoiceOver.log("  #{method_name}(#{args.map(&:inspect).join(', ')}) failed: #{e.message}")
+              val = nil
+              break  # non-argument errors are unlikely to be fixed by fewer args
             end
-          rescue StandardError => e
-            PokedexVoiceOver.log("  #{method_name}() call failed: #{e.message}")
+          end
+
+          result = _extract_text.call(val)
+          if result
+            text = result
+            PokedexVoiceOver.log("  Displayed text found via #{method_name}(#{called_with&.map(&:inspect)&.join(', ')})")
+            break
           end
         end
       end
@@ -889,9 +949,51 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
-      # Strategy 2: Try GameData for both regular and fused species
+      # Strategy 4: Check @sprites hash for text overlay windows
+      # KIF stores Pokédex text in sprite overlay windows; the displayed entry
+      # text is often in a Window with a .text property.
+      if text.nil? && instance_variable_defined?(:@sprites) && @sprites.is_a?(Hash)
+        @sprites.each do |key, sprite|
+          next unless sprite
+          # Try .text property (common for Window_UnformattedTextPokemon etc.)
+          [:text, :getText].each do |text_method|
+            next unless sprite.respond_to?(text_method)
+            begin
+              val = sprite.send(text_method)
+              if val.is_a?(String) && val.strip.length > 10
+                text = val
+                PokedexVoiceOver.log("  Displayed text found in @sprites[#{key.inspect}].#{text_method}")
+                break
+              end
+            rescue StandardError
+              next
+            end
+          end
+          break if text
+        end
+      end
+
+      # Strategy 5: Try GameData for both regular and fused species
+      # For fusions, cross-check the composite result against the head
+      # species' base entry text — if they match, the composite lookup
+      # returned stale/wrong data (the head species text, not the fusion's).
       if text.nil? && defined?(GameData::Species)
         head, fused = pokedex_vo_current_species
+
+        # Pre-fetch head species' base text for cross-checking fusions
+        head_base_text = nil
+        if head && fused
+          begin
+            head_data = GameData::Species.get(head)
+            if head_data.respond_to?(:real_description)
+              head_base_text = head_data.real_description
+            elsif head_data.respond_to?(:pokedex_entry)
+              head_base_text = head_data.pokedex_entry
+            end
+          rescue StandardError
+            # ignore — head_base_text remains nil
+          end
+        end
 
         # For fusions, try the composite species ID first — KIF registers
         # fusion entries under the composite key in GameData::Species.
@@ -904,15 +1006,30 @@ if defined?(PokemonPokedexInfo_Scene)
           if composite
             begin
               data = GameData::Species.get(composite)
+              candidate = nil
               if data.respond_to?(:pokedex_entry)
                 val = data.pokedex_entry
-                text = val if val.is_a?(String) && val.strip.length > 10
+                candidate = val if val.is_a?(String) && val.strip.length > 10
               end
-              if text.nil? && data.respond_to?(:real_description)
+              if candidate.nil? && data.respond_to?(:real_description)
                 val = data.real_description
-                text = val if val.is_a?(String) && val.strip.length > 10
+                candidate = val if val.is_a?(String) && val.strip.length > 10
               end
-              PokedexVoiceOver.log("  Displayed text found via GameData (composite #{composite})") if text
+              # Discard if the composite text is identical to the head
+              # species' base entry — this means GameData returned the
+              # base species' text rather than the fusion's custom entry.
+              if candidate && head_base_text
+                norm_candidate = PokedexVoiceOver._normalize_text(candidate)
+                norm_head = PokedexVoiceOver._normalize_text(head_base_text)
+                if norm_candidate == norm_head
+                  PokedexVoiceOver.log("  GameData composite #{composite} text matches head species base entry — discarding as stale")
+                  candidate = nil
+                end
+              end
+              if candidate
+                text = candidate
+                PokedexVoiceOver.log("  Displayed text found via GameData (composite #{composite})")
+              end
             rescue StandardError => e
               PokedexVoiceOver.log("  GameData composite lookup failed: #{e.message}")
             end
@@ -935,17 +1052,32 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
-      # Strategy 3: Try pbGetMessage for regular species
+      # Strategy 6: Try pbGetMessage for both regular and fused species
       if text.nil?
         head, fused = pokedex_vo_current_species
-        if head && fused.nil? && defined?(MessageTypes) && defined?(MessageTypes::Entries)
+        if defined?(MessageTypes) && defined?(MessageTypes::Entries)
           begin
-            sp_data = GameData::Species.get(head) if defined?(GameData::Species)
-            id_num = sp_data.id_number if sp_data && sp_data.respond_to?(:id_number)
-            if id_num
-              text = pbGetMessage(MessageTypes::Entries, id_num) rescue nil
-              PokedexVoiceOver.log("  Displayed text found via pbGetMessage") if text && !text.empty?
-              text = nil if text && text.empty?
+            # For fusions, try the composite ID first
+            if head && fused
+              nb = PokedexVoiceOver.nb_pokemon
+              if nb && nb > 0 && head.is_a?(Integer) && fused.is_a?(Integer)
+                composite = head * nb + fused
+                val = pbGetMessage(MessageTypes::Entries, composite) rescue nil
+                if val.is_a?(String) && !val.strip.empty? && val.strip.length > 10
+                  text = val
+                  PokedexVoiceOver.log("  Displayed text found via pbGetMessage (composite #{composite})")
+                end
+              end
+            end
+            # For regular species, or if fusion pbGetMessage failed
+            if text.nil? && head
+              sp_data = GameData::Species.get(head) if defined?(GameData::Species)
+              id_num = sp_data.id_number if sp_data && sp_data.respond_to?(:id_number)
+              if id_num
+                text = pbGetMessage(MessageTypes::Entries, id_num) rescue nil
+                PokedexVoiceOver.log("  Displayed text found via pbGetMessage") if text && !text.empty?
+                text = nil if text && text.empty?
+              end
             end
           rescue StandardError => e
             PokedexVoiceOver.log("  pbGetMessage text lookup failed: #{e.message}")
@@ -991,6 +1123,9 @@ if defined?(PokemonPokedexInfo_Scene)
           @dex_vo_last_species = [head, fused]
           text = pokedex_vo_displayed_text
           PokedexVoiceOver.play(head, fused, text)
+          # Signal to drawPage that we already played for this species,
+          # preventing double-play when drawPage fires right after us.
+          @dex_vo_scene_played = true
         else
           PokedexVoiceOver.log("  Skipping — page #{page} is not the entry page (#{POKEDEX_VO_ENTRY_PAGE})")
           PokedexVoiceOver.log("  Hint: if the voice should play here, set POKEDEX_VO_ENTRY_PAGE = #{page}")
@@ -1019,7 +1154,15 @@ if defined?(PokemonPokedexInfo_Scene)
           species_changed = current_species != @dex_vo_last_species
           page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
 
-          if species_changed
+          # Check and clear the navigation/scene played flags to prevent
+          # double-play when pbGoToNext/pbGoToPrevious or pbStartScene
+          # already played for this species.
+          if @dex_vo_nav_played || @dex_vo_scene_played
+            PokedexVoiceOver.log("  pbShowPage: skipping — already played by #{@dex_vo_nav_played ? 'navigation' : 'pbStartScene'} hook")
+            @dex_vo_last_species = current_species
+            @dex_vo_nav_played = false
+            @dex_vo_scene_played = false
+          elsif species_changed
             PokedexVoiceOver.log("  pbShowPage: species changed — playing")
             @dex_vo_last_species = current_species
             text = pokedex_vo_displayed_text
@@ -1051,9 +1194,15 @@ if defined?(PokemonPokedexInfo_Scene)
             species_changed = current_species != @dex_vo_last_species
             page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
 
-            # Play when the species changed (scroll/navigation) or when
-            # returning to the entry page from another page (if enabled).
-            if species_changed
+            # Check and clear the navigation/scene played flags to prevent
+            # double-play when pbGoToNext/pbGoToPrevious or pbStartScene
+            # already played for this species.
+            if @dex_vo_nav_played || @dex_vo_scene_played
+              PokedexVoiceOver.log("  drawPage: skipping — already played by #{@dex_vo_nav_played ? 'navigation' : 'pbStartScene'} hook")
+              @dex_vo_last_species = current_species
+              @dex_vo_nav_played = false
+              @dex_vo_scene_played = false
+            elsif species_changed
               PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
               @dex_vo_last_species = current_species
               text = pokedex_vo_displayed_text
@@ -1100,9 +1249,6 @@ if defined?(PokemonPokedexInfo_Scene)
 
         PokedexVoiceOver.log("pbGoToNext fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
-        # Always trigger voice on navigation — drawPage's species-change
-        # detection is the primary guard against double-play, and the
-        # generation counter in play() handles cancellation of stale threads.
         head, fused = pokedex_vo_current_species
         @dex_vo_last_species = [head, fused]
         if head == prev_species&.first && fused == prev_species&.last
@@ -1110,6 +1256,10 @@ if defined?(PokemonPokedexInfo_Scene)
         end
         text = pokedex_vo_displayed_text
         PokedexVoiceOver.play(head, fused, text)
+        # Signal to drawPage/pbShowPage that we already played for this
+        # species, preventing the double-play that occurs when the page
+        # rendering hook fires immediately after navigation.
+        @dex_vo_nav_played = true
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToNext is NOT defined — cannot hook next-entry navigation")
@@ -1125,7 +1275,6 @@ if defined?(PokemonPokedexInfo_Scene)
 
         PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
-        # Always trigger voice on navigation — same rationale as pbGoToNext.
         head, fused = pokedex_vo_current_species
         @dex_vo_last_species = [head, fused]
         if head == prev_species&.first && fused == prev_species&.last
@@ -1133,6 +1282,10 @@ if defined?(PokemonPokedexInfo_Scene)
         end
         text = pokedex_vo_displayed_text
         PokedexVoiceOver.play(head, fused, text)
+        # Signal to drawPage/pbShowPage that we already played for this
+        # species, preventing the double-play that occurs when the page
+        # rendering hook fires immediately after navigation.
+        @dex_vo_nav_played = true
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToPrevious is NOT defined — cannot hook previous-entry navigation")
