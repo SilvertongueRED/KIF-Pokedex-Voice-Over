@@ -38,7 +38,59 @@
 # you can see exactly where the process stops.
 # =============================================================================
 
-require "json"
+# Try to load the json standard library.  MKXP-EX (the Ruby runtime used by
+# KIF) does not ship the json gem, so we fall back to a tiny parser that
+# handles the flat { "key": value } objects produced by generate_voices.py.
+begin
+  require "json"
+rescue ScriptError, StandardError
+  module JSON
+    # Minimal JSON parser — supports flat objects whose values are strings,
+    # numbers, booleans, or null.  This is sufficient for dex_durations.json
+    # and dex_entry_map.json (both are single-level hashes produced by
+    # Python's json.dump with indent=2).
+    def self.parse(str)
+      result = {}
+      # Strip surrounding braces and iterate over "key": value pairs.
+      inner = str.strip.sub(/\A\{/, "").sub(/\}\s*\z/, "")
+      inner.scan(/"((?:[^"\\]|\\.)*)"\s*:\s*("(?:[^"\\]|\\.)*"|[-+]?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?|true|false|null)/) do |key, val|
+        key = _unescape(key)
+        if val.start_with?('"')
+          result[key] = _unescape(val[1..-2])
+        elsif val == "true"
+          result[key] = true
+        elsif val == "false"
+          result[key] = false
+        elsif val == "null"
+          result[key] = nil
+        elsif val.include?(".") || val.include?("e") || val.include?("E")
+          result[key] = val.to_f
+        else
+          result[key] = val.to_i
+        end
+      end
+      result
+    end
+
+    def self._unescape(s)
+      s.gsub(/\\(["\\\/bfnrt]|u[0-9a-fA-F]{4})/) do |m|
+        case m
+        when '\\"' then '"'
+        when '\\\\' then '\\'
+        when '\\/' then '/'
+        when '\\b' then "\b"
+        when '\\f' then "\f"
+        when '\\n' then "\n"
+        when '\\r' then "\r"
+        when '\\t' then "\t"
+        else
+          # \\uXXXX
+          [m[2..5].to_i(16)].pack("U")
+        end
+      end
+    end
+  end
+end
 
 module PokedexVoiceOver
   MOD_ID = "pokedex_voice_over"
