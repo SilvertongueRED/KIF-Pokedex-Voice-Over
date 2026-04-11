@@ -176,16 +176,23 @@ _DEX_ENTRY_RE = re.compile(
 
 
 def _clean_entry_text(raw: str) -> str:
-    """Normalise a raw Pokédex entry string for TTS consumption."""
+    """Normalise a raw Pokédex entry string for TTS consumption.
+
+    We intentionally keep punctuation and double-spaces intact so that
+    the entry-map text is as close as possible to what KIF displays at
+    runtime.  The mod's ``_normalize_text`` in main.rb strips punctuation
+    and collapses whitespace aggressively before comparison, so minor
+    formatting differences no longer cause matching failures.
+    """
     # Replace escaped newlines with a space
     text = raw.replace("\\n", " ")
     # Remove any remaining backslash escapes
     text = re.sub(r"\\.", " ", text)
-    # Collapse whitespace
-    text = re.sub(r"\s+", " ", text).strip()
-    # Strip trailing punctuation inconsistencies
-    if text and text[-1] not in ".!?":
-        text += "."
+    # Collapse runs of 3+ whitespace characters to double-space (preserve
+    # the double-spaces that KIF's text engine commonly produces), then
+    # strip leading/trailing whitespace.
+    text = re.sub(r"[ \t]{3,}", "  ", text)
+    text = text.strip()
     return text
 
 
