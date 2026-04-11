@@ -50,7 +50,7 @@ module PokedexVoiceOver
 
   # Delay (seconds) before voice-over playback begins, allowing the Pokémon's
   # cry to finish before the Pokédex entry is read aloud.
-  CRY_DELAY = 1.0
+  CRY_DELAY = 0.5
 
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
@@ -219,6 +219,20 @@ module PokedexVoiceOver
       rescue StandardError
         nil
       end
+      # Last resort: iterate GameData looking for matching id_number
+      begin
+        if defined?(GameData::Species)
+          GameData::Species.each do |sp|
+            if sp.respond_to?(:id_number) && sp.id_number == species
+              log("  species_str: resolved #{species} to #{sp.id.inspect} via id_number scan")
+              return sp.id.to_s.upcase
+            end
+          end
+        end
+      rescue StandardError
+        nil
+      end
+      log("  WARNING: species_str falling back to raw integer #{species} — no name resolution succeeded")
       return species.to_s
     end
 
@@ -520,6 +534,22 @@ end
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
 #
+# KNOWN BUG FIXES (v1.9.0)
+# -------------------------
+# - CRY_DELAY reduced from 1.0s to 0.5s — voice reads sooner after opening.
+# - Fusion species detection: composite-ID decomposition now also tries
+#   @dummyPokemon.id_number when .species returns a Symbol, fixing fusions
+#   that returned the wrong species name or played the wrong audio file.
+# - species_str: added id_number scan fallback when GameData::Species.get()
+#   and PBSpecies both fail for an integer ID, with warning log when falling
+#   back to raw number.
+# - Scrolling voice: pbGoToNext/pbGoToPrevious no longer gate playback on
+#   @page == ENTRY_PAGE (the page ivar could be stale after scrolling).
+#   Voice now always triggers on navigation.
+# - drawPage and pbShowPage hooks now detect species changes (not just page
+#   changes), so voice plays reliably after scrolling even if pbGoToNext
+#   fires with stale state or is bypassed by the engine.
+#
 # KNOWN BUG FIXES (v1.8.0)
 # -------------------------
 # - Species detection now prioritizes @dummyPokemon (refreshed by
@@ -717,16 +747,39 @@ if defined?(PokemonPokedexInfo_Scene)
 
       # --- Fusion decomposition from composite integer ID ---
       # KIF encodes fused Pokémon as: head_id * NB_POKEMON + body_id.
-      if fused.nil? && head.is_a?(Integer) && head > 0
-        nb_pokemon = PokedexVoiceOver.nb_pokemon
+      # We try to obtain a numeric composite ID from multiple sources:
+      #   1. head itself (if it's already an integer > NB_POKEMON)
+      #   2. @dummyPokemon.id_number (when head is a Symbol but id_number
+      #      holds the composite integer — common in newer KIF builds)
+      if fused.nil?
+        composite = nil
+        if head.is_a?(Integer) && head > 0
+          composite = head
+        elsif instance_variable_defined?(:@dummyPokemon) && @dummyPokemon
+          # head was a Symbol — try id_number for the composite integer
+          dummy = @dummyPokemon
+          if dummy.respond_to?(:id_number)
+            begin
+              val = dummy.id_number
+              composite = val if val.is_a?(Integer) && val > 0
+              PokedexVoiceOver.log("  Fusion decomposition: id_number=#{val.inspect} (head was #{head.class})")
+            rescue StandardError => e
+              PokedexVoiceOver.log("  @dummyPokemon.id_number failed: #{e.message}")
+            end
+          end
+        end
 
-        if nb_pokemon && nb_pokemon > 0 && head > nb_pokemon
-          body_id = head % nb_pokemon
-          head_id = head / nb_pokemon
-          if head_id > 0 && body_id > 0
-            PokedexVoiceOver.log("  Detected fused species ID #{head} => head=#{head_id}, body=#{body_id} (NB_POKEMON=#{nb_pokemon})")
-            fused = body_id
-            head = head_id
+        if composite
+          nb_pokemon = PokedexVoiceOver.nb_pokemon
+
+          if nb_pokemon && nb_pokemon > 0 && composite > nb_pokemon
+            body_id = composite % nb_pokemon
+            head_id = composite / nb_pokemon
+            if head_id > 0 && body_id > 0
+              PokedexVoiceOver.log("  Detected fused species ID #{composite} => head=#{head_id}, body=#{body_id} (NB_POKEMON=#{nb_pokemon})")
+              fused = body_id
+              head = head_id
+            end
           end
         end
       end
@@ -960,13 +1013,18 @@ if defined?(PokemonPokedexInfo_Scene)
 
         PokedexVoiceOver.log("pbShowPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
 
-        # Only play when the user navigates TO the entry page, not on every
-        # call.  We also honour the "play_on_page_change" setting so players
-        # who do not want the voice to restart on every revisit can turn it
-        # off.
-        if page == POKEDEX_VO_ENTRY_PAGE && prev_page != POKEDEX_VO_ENTRY_PAGE
-          if PokedexVoiceOver.play_on_page_change?
-            head, fused = pokedex_vo_current_species
+        if page == POKEDEX_VO_ENTRY_PAGE
+          head, fused = pokedex_vo_current_species
+          current_species = [head, fused]
+          species_changed = current_species != @dex_vo_last_species
+          page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
+
+          if species_changed
+            PokedexVoiceOver.log("  pbShowPage: species changed — playing")
+            @dex_vo_last_species = current_species
+            text = pokedex_vo_displayed_text
+            PokedexVoiceOver.play(head, fused, text)
+          elsif page_changed && PokedexVoiceOver.play_on_page_change?
             text = pokedex_vo_displayed_text
             PokedexVoiceOver.play(head, fused, text)
           end
@@ -987,9 +1045,21 @@ if defined?(PokemonPokedexInfo_Scene)
 
           PokedexVoiceOver.log("drawPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
 
-          if page == POKEDEX_VO_ENTRY_PAGE && prev_page != POKEDEX_VO_ENTRY_PAGE
-            if PokedexVoiceOver.play_on_page_change?
-              head, fused = pokedex_vo_current_species
+          if page == POKEDEX_VO_ENTRY_PAGE
+            head, fused = pokedex_vo_current_species
+            current_species = [head, fused]
+            species_changed = current_species != @dex_vo_last_species
+            page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
+
+            # Play when the species changed (scroll/navigation) or when
+            # returning to the entry page from another page (if enabled).
+            if species_changed
+              PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
+              @dex_vo_last_species = current_species
+              text = pokedex_vo_displayed_text
+              PokedexVoiceOver.play(head, fused, text)
+            elsif page_changed && PokedexVoiceOver.play_on_page_change?
+              PokedexVoiceOver.log("  drawPage: page changed to entry page — replaying")
               text = pokedex_vo_displayed_text
               PokedexVoiceOver.play(head, fused, text)
             end
@@ -1028,18 +1098,18 @@ if defined?(PokemonPokedexInfo_Scene)
         prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToNext(*args)
 
-        page = @page
-        PokedexVoiceOver.log("pbGoToNext fired — @page=#{page.inspect}, prev_species=#{prev_species.inspect}")
+        PokedexVoiceOver.log("pbGoToNext fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
-        if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
-          head, fused = pokedex_vo_current_species
-          @dex_vo_last_species = [head, fused]
-          if head == prev_species&.first && fused == prev_species&.last
-            PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToNext — possible stale state")
-          end
-          text = pokedex_vo_displayed_text
-          PokedexVoiceOver.play(head, fused, text)
+        # Always trigger voice on navigation — drawPage's species-change
+        # detection is the primary guard against double-play, and the
+        # generation counter in play() handles cancellation of stale threads.
+        head, fused = pokedex_vo_current_species
+        @dex_vo_last_species = [head, fused]
+        if head == prev_species&.first && fused == prev_species&.last
+          PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToNext — possible stale state")
         end
+        text = pokedex_vo_displayed_text
+        PokedexVoiceOver.play(head, fused, text)
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToNext is NOT defined — cannot hook next-entry navigation")
@@ -1053,18 +1123,16 @@ if defined?(PokemonPokedexInfo_Scene)
         prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToPrevious(*args)
 
-        page = @page
-        PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{page.inspect}, prev_species=#{prev_species.inspect}")
+        PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
-        if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
-          head, fused = pokedex_vo_current_species
-          @dex_vo_last_species = [head, fused]
-          if head == prev_species&.first && fused == prev_species&.last
-            PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToPrevious — possible stale state")
-          end
-          text = pokedex_vo_displayed_text
-          PokedexVoiceOver.play(head, fused, text)
+        # Always trigger voice on navigation — same rationale as pbGoToNext.
+        head, fused = pokedex_vo_current_species
+        @dex_vo_last_species = [head, fused]
+        if head == prev_species&.first && fused == prev_species&.last
+          PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToPrevious — possible stale state")
         end
+        text = pokedex_vo_displayed_text
+        PokedexVoiceOver.play(head, fused, text)
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToPrevious is NOT defined — cannot hook previous-entry navigation")
