@@ -877,7 +877,7 @@ if defined?(PokemonPokedexInfo_Scene)
         end
 
         # Helper to extract a usable string from a method return value
-        _extract_text = lambda do |val|
+        extract_text = lambda do |val|
           if val.is_a?(String) && val.strip.length > 10
             val
           elsif val.is_a?(Array)
@@ -923,7 +923,7 @@ if defined?(PokemonPokedexInfo_Scene)
             end
           end
 
-          result = _extract_text.call(val)
+          result = extract_text.call(val)
           if result
             text = result
             PokedexVoiceOver.log("  Displayed text found via #{method_name}(#{called_with&.map(&:inspect)&.join(', ')})")
