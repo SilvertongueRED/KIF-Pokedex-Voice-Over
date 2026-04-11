@@ -38,6 +38,8 @@
 # you can see exactly where the process stops.
 # =============================================================================
 
+require "json"
+
 module PokedexVoiceOver
   MOD_ID = "pokedex_voice_over"
 
@@ -113,7 +115,6 @@ module PokedexVoiceOver
     path = "Audio/SE/#{AUDIO_SUBDIR}/dex_durations.json"
     @durations = begin
       if FileTest.exist?(path)
-        require "json"
         JSON.parse(File.read(path))
       else
         {}
@@ -134,7 +135,6 @@ module PokedexVoiceOver
     path = "Audio/SE/#{AUDIO_SUBDIR}/dex_entry_map.json"
     @entry_map = begin
       if FileTest.exist?(path)
-        require "json"
         data = JSON.parse(File.read(path))
         log("  Loaded entry map: #{data.size} entries from #{path}")
         data
@@ -424,8 +424,92 @@ module PokedexVoiceOver
     @playback_gen = (@playback_gen || 0) + 1
     my_gen = @playback_gen  # snapshot so the thread can self-cancel
 
-    # All playback goes through a background thread so the CRY_DELAY and any
-    # sequential waits never freeze the game loop.
+    # ------------------------------------------------------------------
+    # Resolve which file(s) to play on the MAIN THREAD.
+    # All file-existence checks, variant matching, entry_map / durations
+    # loading, and JSON parsing happen here — these operations are not
+    # thread-safe in MKXP-EX (the Ruby runtime used by KIF) because
+    # `require` can deadlock when called from a background thread.
+    # ------------------------------------------------------------------
+    # playback_mode: :single, :sequential, or :none
+    playback_mode = :none
+    chosen_file   = nil   # for :single mode
+    seq_head      = nil   # for :sequential mode
+    seq_body      = nil
+    seq_head_dur  = nil
+    play_vol      = volume
+
+    begin
+      if fused
+        fusion_bare = "#{AUDIO_SUBDIR}/dex_#{base}_#{fused}"
+
+        # Check for the primary fusion file and any variants
+        fusion_variants = _find_variants(fusion_bare)
+
+        # Try reversed ordering (dex_BODY_HEAD) if forward not found.
+        # KIF may encode fusions with head/body in either order depending
+        # on version and how the composite ID is decomposed.
+        if fusion_variants.empty?
+          reversed_bare = "#{AUDIO_SUBDIR}/dex_#{fused}_#{base}"
+          fusion_variants = _find_variants(reversed_bare)
+          if fusion_variants.any?
+            log("  Using reversed fusion ordering: #{reversed_bare}")
+            fusion_bare = reversed_bare
+          end
+        end
+
+        if fusion_variants.any?
+          matched = _match_variant(fusion_variants, displayed_text)
+          if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
+            log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+          end
+          chosen_file = matched || fusion_variants.sample
+          playback_mode = :single
+          log("  Playing fusion audio: #{chosen_file} (from #{fusion_variants.length} variant(s), matched=#{!matched.nil?})")
+        else
+          # No custom fusion entry — fall back to sequential base-species playback
+          bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
+          bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
+
+          if _audio_exists?(bare_head) && _audio_exists?(bare_body)
+            seq_head = bare_head
+            seq_body = bare_body
+            seq_head_dur = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+            playback_mode = :sequential
+            log("  Playing sequential: #{seq_head} then #{seq_body}")
+          else
+            log("  No fusion or sequential audio available — skipping")
+          end
+        end
+      else
+        bare = "#{AUDIO_SUBDIR}/dex_#{base}"
+
+        # Check for the primary file and any variants
+        variants = _find_variants(bare)
+        if variants.empty?
+          log("  No audio file found — skipping")
+          return
+        end
+
+        matched = _match_variant(variants, displayed_text)
+        if matched.nil? && variants.length > 1 && entry_map.empty?
+          log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+        end
+        chosen_file = matched || variants.sample
+        playback_mode = :single
+        log("  Playing species audio: #{chosen_file} (from #{variants.length} variant(s), matched=#{!matched.nil?})")
+      end
+    rescue StandardError => e
+      log("  File resolution error: #{e.class}: #{e.message}")
+      return
+    end
+
+    return if playback_mode == :none
+
+    # ------------------------------------------------------------------
+    # Background thread: only handles the CRY_DELAY sleep and the actual
+    # Audio.se_play / _play_bare calls — no file I/O or `require` here.
+    # ------------------------------------------------------------------
     begin
       Thread.new do
         begin
@@ -433,68 +517,16 @@ module PokedexVoiceOver
           _interruptible_sleep(CRY_DELAY, my_gen)
           next if @playback_gen != my_gen
 
-          if fused
-            fusion_bare = "#{AUDIO_SUBDIR}/dex_#{base}_#{fused}"
-
-            # Check for the primary fusion file and any variants
-            fusion_variants = _find_variants(fusion_bare)
-
-            # Try reversed ordering (dex_BODY_HEAD) if forward not found.
-            # KIF may encode fusions with head/body in either order depending
-            # on version and how the composite ID is decomposed.
-            reversed_bare = nil
-            if fusion_variants.empty?
-              reversed_bare = "#{AUDIO_SUBDIR}/dex_#{fused}_#{base}"
-              fusion_variants = _find_variants(reversed_bare)
-              if fusion_variants.any?
-                log("  Using reversed fusion ordering: #{reversed_bare}")
-                fusion_bare = reversed_bare
-              end
+          case playback_mode
+          when :single
+            _play_bare(chosen_file)
+          when :sequential
+            Audio.se_stop
+            Audio.se_play(seq_head, play_vol, 100)
+            _interruptible_sleep(seq_head_dur, my_gen)
+            if @playback_gen == my_gen
+              Audio.se_play(seq_body, play_vol, 100)
             end
-
-            if fusion_variants.any?
-              matched = _match_variant(fusion_variants, displayed_text)
-              if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
-                log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
-              end
-              chosen = matched || fusion_variants.sample
-              log("  Playing fusion audio: #{chosen} (from #{fusion_variants.length} variant(s), matched=#{!matched.nil?})")
-              _play_bare(chosen)
-            else
-              # No custom fusion entry — fall back to sequential base-species playback
-              bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
-              bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
-
-              if _audio_exists?(bare_head) && _audio_exists?(bare_body)
-                log("  Playing sequential: #{bare_head} then #{bare_body}")
-                head_duration = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
-                Audio.se_stop
-                Audio.se_play(bare_head, volume, 100)
-                _interruptible_sleep(head_duration, my_gen)
-                if @playback_gen == my_gen
-                  Audio.se_play(bare_body, volume, 100)
-                end
-              else
-                log("  No fusion or sequential audio available — skipping")
-              end
-            end
-          else
-            bare = "#{AUDIO_SUBDIR}/dex_#{base}"
-
-            # Check for the primary file and any variants
-            variants = _find_variants(bare)
-            if variants.empty?
-              log("  No audio file found — skipping")
-              next
-            end
-
-            matched = _match_variant(variants, displayed_text)
-            if matched.nil? && variants.length > 1 && entry_map.empty?
-              log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
-            end
-            chosen = matched || variants.sample
-            log("  Playing species audio: #{chosen} (from #{variants.length} variant(s), matched=#{!matched.nil?})")
-            _play_bare(chosen)
           end
         rescue StandardError => e
           PokedexVoiceOver.log("  Playback thread error: #{e.class}: #{e.message}")
@@ -861,7 +893,7 @@ if defined?(PokemonPokedexInfo_Scene)
     #   3.   Instance variable scan (may be stale after navigation)
     #   4.   GameData lookups
     #   5.   pbGetMessage fallback
-    def pokedex_vo_displayed_text(skip_stale_check = false)
+    def pokedex_vo_displayed_text
       text = nil
 
       # Strategy 1: @dummyPokemon (most reliable — refreshed each navigation)
@@ -887,18 +919,13 @@ if defined?(PokemonPokedexInfo_Scene)
 
       # Strategy 1.5: @randomEntryText (KIF stores randomly-chosen fusion entry text here)
       # KIF's drawEntryText sets @randomEntryText to the text it actually displays
-      # for generated fusion entries.  After navigation, the game sets this to nil
-      # before drawEntryText re-assigns it, so a nil value here simply means the
-      # text hasn't been set yet — the nil/length guard below handles that case.
+      # for generated fusion entries.  After dex_vo_orig_drawPage runs,
+      # @randomEntryText IS the authoritative text — trust it unconditionally.
       if text.nil? && instance_variable_defined?(:@randomEntryText)
         val = instance_variable_get(:@randomEntryText)
         if val.is_a?(String) && val.strip.length > 10
-          if skip_stale_check && val == @dex_vo_last_displayed_text
-            PokedexVoiceOver.log("  @randomEntryText matches last displayed text — skipping (possibly stale)")
-          else
-            text = val
-            PokedexVoiceOver.log("  Displayed text found via @randomEntryText")
-          end
+          text = val
+          PokedexVoiceOver.log("  Displayed text found via @randomEntryText")
         end
       end
 
@@ -1174,7 +1201,6 @@ if defined?(PokemonPokedexInfo_Scene)
 
       def pbStartScene(*args)
         dex_vo_orig_pbStartScene(*args)
-        @dex_vo_last_displayed_text = nil
 
         # NOTE: @page is nil (not an error) if the original method hasn't
         # set it yet.  In Ruby, accessing an undefined ivar returns nil —
@@ -1227,25 +1253,21 @@ if defined?(PokemonPokedexInfo_Scene)
 
           if @dex_vo_pending_play
             # Deferred playback from pbStartScene or navigation hooks.
-            # @randomEntryText may be stale — use skip_stale_check to fall
-            # through to fresher text detection strategies when needed.
+            # dex_vo_orig_pbShowPage already ran, so @randomEntryText is fresh.
             PokedexVoiceOver.log("  pbShowPage: pending play flag set — playing with fresh text")
             @dex_vo_last_species = current_species
             @dex_vo_pending_play = false
-            text = pokedex_vo_displayed_text(true)
+            text = pokedex_vo_displayed_text
             PokedexVoiceOver.play(head, fused, text)
-            @dex_vo_last_displayed_text = text
           elsif species_changed
             PokedexVoiceOver.log("  pbShowPage: species changed — playing")
             @dex_vo_last_species = current_species
             @dex_vo_pending_play = false  # clear pending flag to prevent double-play
-            text = pokedex_vo_displayed_text(true)
+            text = pokedex_vo_displayed_text
             PokedexVoiceOver.play(head, fused, text)
-            @dex_vo_last_displayed_text = text
           elsif page_changed && PokedexVoiceOver.play_on_page_change?
             text = pokedex_vo_displayed_text
             PokedexVoiceOver.play(head, fused, text)
-            @dex_vo_last_displayed_text = text
           end
         end
       end
@@ -1272,26 +1294,22 @@ if defined?(PokemonPokedexInfo_Scene)
 
             if @dex_vo_pending_play
               # Deferred playback from pbStartScene or navigation hooks.
-              # @randomEntryText may be stale — use skip_stale_check to fall
-              # through to fresher text detection strategies when needed.
+              # dex_vo_orig_drawPage already ran, so @randomEntryText is fresh.
               PokedexVoiceOver.log("  drawPage: pending play flag set — playing with fresh text")
               @dex_vo_last_species = current_species
               @dex_vo_pending_play = false
-              text = pokedex_vo_displayed_text(true)
+              text = pokedex_vo_displayed_text
               PokedexVoiceOver.play(head, fused, text)
-              @dex_vo_last_displayed_text = text
             elsif species_changed
               PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
               @dex_vo_last_species = current_species
               @dex_vo_pending_play = false  # clear pending flag to prevent double-play
-              text = pokedex_vo_displayed_text(true)
+              text = pokedex_vo_displayed_text
               PokedexVoiceOver.play(head, fused, text)
-              @dex_vo_last_displayed_text = text
             elsif page_changed && PokedexVoiceOver.play_on_page_change?
               PokedexVoiceOver.log("  drawPage: page changed to entry page — replaying")
               text = pokedex_vo_displayed_text
               PokedexVoiceOver.play(head, fused, text)
-              @dex_vo_last_displayed_text = text
             end
           end
         end
@@ -1310,7 +1328,6 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbEndScene(*args)
         PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
-        @dex_vo_last_displayed_text = nil
         dex_vo_orig_pbEndScene(*args)
       end
     else
