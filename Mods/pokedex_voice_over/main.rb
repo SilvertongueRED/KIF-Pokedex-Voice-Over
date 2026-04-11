@@ -452,6 +452,9 @@ module PokedexVoiceOver
 
             if fusion_variants.any?
               matched = _match_variant(fusion_variants, displayed_text)
+              if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
+                log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+              end
               chosen = matched || fusion_variants.sample
               log("  Playing fusion audio: #{chosen} (from #{fusion_variants.length} variant(s), matched=#{!matched.nil?})")
               _play_bare(chosen)
@@ -484,6 +487,9 @@ module PokedexVoiceOver
             end
 
             matched = _match_variant(variants, displayed_text)
+            if matched.nil? && variants.length > 1 && entry_map.empty?
+              log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+            end
             chosen = matched || variants.sample
             log("  Playing species audio: #{chosen} (from #{variants.length} variant(s), matched=#{!matched.nil?})")
             _play_bare(chosen)
@@ -533,6 +539,18 @@ end
 #
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
+#
+# KNOWN BUG FIXES (v1.12.0)
+# --------------------------
+# - Fixed stale displayed text: navigation hooks (pbGoToNext/pbGoToPrevious)
+#   and pbStartScene no longer read @randomEntryText or call play() directly.
+#   Instead they set @dex_vo_pending_play = true.  drawPage/pbShowPage — which
+#   fire AFTER drawEntryText has updated @randomEntryText — are now the single
+#   canonical place where text is read and play() is called.
+# - Added a prominent warning when multiple audio variants exist but
+#   dex_entry_map.json is missing (tells user to run tools/generate_voices.py).
+# - Simplified double-play prevention: replaced @dex_vo_nav_played and
+#   @dex_vo_scene_played with a single @dex_vo_pending_play flag.
 #
 # KNOWN BUG FIXES (v1.10.0)
 # --------------------------
@@ -1162,11 +1180,10 @@ if defined?(PokemonPokedexInfo_Scene)
         if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
           @dex_vo_last_species = [head, fused]
-          text = pokedex_vo_displayed_text
-          PokedexVoiceOver.play(head, fused, text)
-          # Signal to drawPage that we already played for this species,
-          # preventing double-play when drawPage fires right after us.
-          @dex_vo_scene_played = true
+          # Defer playback to drawPage/pbShowPage where @randomEntryText
+          # will have been updated by drawEntryText.
+          @dex_vo_pending_play = true
+          PokedexVoiceOver.log("  Deferred playback — @dex_vo_pending_play set")
         else
           PokedexVoiceOver.log("  Skipping — page #{page} is not the entry page (#{POKEDEX_VO_ENTRY_PAGE})")
           PokedexVoiceOver.log("  Hint: if the voice should play here, set POKEDEX_VO_ENTRY_PAGE = #{page}")
@@ -1195,14 +1212,14 @@ if defined?(PokemonPokedexInfo_Scene)
           species_changed = current_species != @dex_vo_last_species
           page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
 
-          # Check and clear the navigation/scene played flags to prevent
-          # double-play when pbGoToNext/pbGoToPrevious or pbStartScene
-          # already played for this species.
-          if @dex_vo_nav_played || @dex_vo_scene_played
-            PokedexVoiceOver.log("  pbShowPage: skipping — already played by #{@dex_vo_nav_played ? 'navigation' : 'pbStartScene'} hook")
+          if @dex_vo_pending_play
+            # Deferred playback from pbStartScene or navigation hooks.
+            # @randomEntryText is now fresh because drawEntryText has run.
+            PokedexVoiceOver.log("  pbShowPage: pending play flag set — playing with fresh text")
             @dex_vo_last_species = current_species
-            @dex_vo_nav_played = false
-            @dex_vo_scene_played = false
+            @dex_vo_pending_play = false
+            text = pokedex_vo_displayed_text
+            PokedexVoiceOver.play(head, fused, text)
           elsif species_changed
             PokedexVoiceOver.log("  pbShowPage: species changed — playing")
             @dex_vo_last_species = current_species
@@ -1235,14 +1252,14 @@ if defined?(PokemonPokedexInfo_Scene)
             species_changed = current_species != @dex_vo_last_species
             page_changed = prev_page != POKEDEX_VO_ENTRY_PAGE
 
-            # Check and clear the navigation/scene played flags to prevent
-            # double-play when pbGoToNext/pbGoToPrevious or pbStartScene
-            # already played for this species.
-            if @dex_vo_nav_played || @dex_vo_scene_played
-              PokedexVoiceOver.log("  drawPage: skipping — already played by #{@dex_vo_nav_played ? 'navigation' : 'pbStartScene'} hook")
+            if @dex_vo_pending_play
+              # Deferred playback from pbStartScene or navigation hooks.
+              # @randomEntryText is now fresh because drawEntryText has run.
+              PokedexVoiceOver.log("  drawPage: pending play flag set — playing with fresh text")
               @dex_vo_last_species = current_species
-              @dex_vo_nav_played = false
-              @dex_vo_scene_played = false
+              @dex_vo_pending_play = false
+              text = pokedex_vo_displayed_text
+              PokedexVoiceOver.play(head, fused, text)
             elsif species_changed
               PokedexVoiceOver.log("  drawPage: species changed (#{@dex_vo_last_species.inspect} -> #{current_species.inspect}) — playing")
               @dex_vo_last_species = current_species
@@ -1295,12 +1312,10 @@ if defined?(PokemonPokedexInfo_Scene)
         if head == prev_species&.first && fused == prev_species&.last
           PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToNext — possible stale state")
         end
-        text = pokedex_vo_displayed_text
-        PokedexVoiceOver.play(head, fused, text)
-        # Signal to drawPage/pbShowPage that we already played for this
-        # species, preventing the double-play that occurs when the page
-        # rendering hook fires immediately after navigation.
-        @dex_vo_nav_played = true
+        # Defer playback to drawPage/pbShowPage where @randomEntryText
+        # will have been updated by drawEntryText.
+        @dex_vo_pending_play = true
+        PokedexVoiceOver.log("  Deferred playback — @dex_vo_pending_play set")
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToNext is NOT defined — cannot hook next-entry navigation")
@@ -1321,12 +1336,10 @@ if defined?(PokemonPokedexInfo_Scene)
         if head == prev_species&.first && fused == prev_species&.last
           PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToPrevious — possible stale state")
         end
-        text = pokedex_vo_displayed_text
-        PokedexVoiceOver.play(head, fused, text)
-        # Signal to drawPage/pbShowPage that we already played for this
-        # species, preventing the double-play that occurs when the page
-        # rendering hook fires immediately after navigation.
-        @dex_vo_nav_played = true
+        # Defer playback to drawPage/pbShowPage where @randomEntryText
+        # will have been updated by drawEntryText.
+        @dex_vo_pending_play = true
+        PokedexVoiceOver.log("  Deferred playback — @dex_vo_pending_play set")
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToPrevious is NOT defined — cannot hook previous-entry navigation")
