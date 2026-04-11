@@ -423,6 +423,19 @@ module PokedexVoiceOver
             # Check for the primary fusion file and any variants
             fusion_variants = _find_variants(fusion_bare)
 
+            # Try reversed ordering (dex_BODY_HEAD) if forward not found.
+            # KIF may encode fusions with head/body in either order depending
+            # on version and how the composite ID is decomposed.
+            reversed_bare = nil
+            if fusion_variants.empty?
+              reversed_bare = "#{AUDIO_SUBDIR}/dex_#{fused}_#{base}"
+              fusion_variants = _find_variants(reversed_bare)
+              if fusion_variants.any?
+                log("  Using reversed fusion ordering: #{reversed_bare}")
+                fusion_bare = reversed_bare
+              end
+            end
+
             if fusion_variants.any?
               matched = _match_variant(fusion_variants, displayed_text)
               chosen = matched || fusion_variants.sample
@@ -507,6 +520,26 @@ end
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
 #
+# KNOWN BUG FIXES (v1.8.0)
+# -------------------------
+# - Species detection now prioritizes @dummyPokemon (refreshed by
+#   pbUpdateDummyPokemon) over @species, which may be stale after scrolling
+#   via pbGoToNext/pbGoToPrevious.  @dexlist[@index] is also checked before
+#   the potentially-stale @species ivar.
+# - Fusion audio lookup now tries both orderings (dex_HEAD_BODY and
+#   dex_BODY_HEAD) since KIF may encode fusions either way depending on
+#   version and composite-ID decomposition order.
+# - Fusion partner is now extracted from @dummyPokemon attributes (.fused,
+#   .fused_species, etc.) before falling back to separate ivars.
+# - Text detection now prioritizes @dummyPokemon attributes and KIF scene
+#   methods (getCustomDexEntry, etc.) over instance variable scanning, which
+#   was often returning stale data after navigation.
+# - Navigation state tracking: pbGoToNext/pbGoToPrevious now log when the
+#   detected species hasn't changed (stale-state warning) to help diagnose
+#   remaining issues.
+# - Enhanced diagnostic logging shows @dummyPokemon capabilities, species
+#   cross-checks, and all detection strategy results.
+#
 # KNOWN BUG FIXES (v1.7.0)
 # -------------------------
 # - Scrolling between Pokémon entries (pbGoToNext / pbGoToPrevious) now
@@ -589,30 +622,61 @@ if defined?(PokemonPokedexInfo_Scene)
 
     # Helper: read the current species + fusion partner from scene state.
     #
-    # Searches multiple instance-variable names used across different
-    # PIF / KIF versions.  Uses instance_variable_defined? instead of
-    # rescue — Ruby ivars return nil silently, so rescue never triggers.
+    # Searches multiple sources in order of reliability after navigation:
+    #   1. @dummyPokemon (explicitly refreshed by pbUpdateDummyPokemon)
+    #   2. @dexlist[@index] (index is updated first during scrolling)
+    #   3. @species and other direct ivars (may be stale after pbGoToNext)
+    #
+    # Uses instance_variable_defined? instead of rescue — Ruby ivars return
+    # nil silently, so rescue never triggers.
     def pokedex_vo_current_species
-      # --- Head species ---
       head = nil
+      fused = nil
 
-      # Direct ivar names used in various KIF / PIF builds
-      [:@species, :@current_species, :@dexdata].each do |var|
-        if instance_variable_defined?(var)
-          val = instance_variable_get(var)
-          next if val.nil?
-          head = val
-          PokedexVoiceOver.log("  Head species found in #{var}: #{val.inspect}")
-          break
+      # --- Strategy 0: @dummyPokemon (most reliable after navigation) ---
+      # KIF creates/updates @dummyPokemon via pbUpdateDummyPokemon for each
+      # dex entry.  It is the freshest source after pbGoToNext/pbGoToPrevious.
+      if instance_variable_defined?(:@dummyPokemon) && @dummyPokemon
+        dummy = @dummyPokemon
+        PokedexVoiceOver.log("  @dummyPokemon class=#{dummy.class}, methods=#{([:species, :fused, :fused_species, :fusion_partner, :fused_with, :getSpecies, :id_number, :speciesName] & dummy.methods).inspect}")
+
+        # Extract head species
+        if dummy.respond_to?(:species)
+          val = dummy.species rescue nil
+          if val && !(val.is_a?(Integer) && val <= 0)
+            head = val
+            PokedexVoiceOver.log("  Head species from @dummyPokemon.species: #{val.inspect}")
+          end
+        end
+
+        # Extract fusion partner from @dummyPokemon
+        if fused.nil?
+          [:fused, :fused_species, :fusion_partner, :fused_with, :fusion_body].each do |attr|
+            next unless dummy.respond_to?(attr)
+            begin
+              val = dummy.send(attr)
+              next if val.nil?
+              next if val.is_a?(Integer) && val <= 0
+              if val.is_a?(Array) && val.length > 0
+                fused = val[0]
+                PokedexVoiceOver.log("  Fused species from @dummyPokemon.#{attr}[0]: #{fused.inspect}")
+              else
+                fused = val
+                PokedexVoiceOver.log("  Fused species from @dummyPokemon.#{attr}: #{fused.inspect}")
+              end
+              break
+            rescue StandardError => e
+              PokedexVoiceOver.log("  @dummyPokemon.#{attr} failed: #{e.message}")
+            end
+          end
         end
       end
 
-      # Fallback: Essentials stores species in @dexlist[@index]
+      # --- Strategy 1: @dexlist[@index] (index is always up-to-date) ---
       if head.nil? && instance_variable_defined?(:@dexlist) && instance_variable_defined?(:@index)
         begin
           entry = instance_variable_get(:@dexlist)[instance_variable_get(:@index)]
           if entry
-            # entry may be an Array [species, ...], a Hash, or an object
             if entry.is_a?(Array)
               head = entry[0]
             elsif entry.respond_to?(:species)
@@ -629,21 +693,31 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
+      # --- Strategy 2: Direct ivar names (may be stale after navigation) ---
+      if head.nil?
+        [:@species, :@current_species, :@dexdata].each do |var|
+          if instance_variable_defined?(var)
+            val = instance_variable_get(var)
+            next if val.nil?
+            head = val
+            PokedexVoiceOver.log("  Head species found in #{var}: #{val.inspect}")
+            break
+          end
+        end
+      end
+
       if head.nil?
         PokedexVoiceOver.log("  WARNING: Could not find head species")
         vars = instance_variables.select { |v| v.to_s =~ /species|dexlist|dexdata|fused|fusion|pokemon/i }
         vars.each do |v|
           PokedexVoiceOver.log("    #{v} = #{instance_variable_get(v).inspect rescue '<error>'}")
         end
-        # Log ALL instance variables so the user can report them
         PokedexVoiceOver.log("  All scene ivars: #{instance_variables.sort.inspect}")
       end
 
-      # --- Fused species ---
-      # KIF encodes fused Pokémon as a single integer: head_id * NB_POKEMON + body_id.
-      # Check for this pattern BEFORE looking for separate fused-species ivars.
-      fused = nil
-      if head.is_a?(Integer) && head > 0
+      # --- Fusion decomposition from composite integer ID ---
+      # KIF encodes fused Pokémon as: head_id * NB_POKEMON + body_id.
+      if fused.nil? && head.is_a?(Integer) && head > 0
         nb_pokemon = PokedexVoiceOver.nb_pokemon
 
         if nb_pokemon && nb_pokemon > 0 && head > nb_pokemon
@@ -657,8 +731,7 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
-      # Fall back to separate fused-species ivars if the integer decomposition
-      # above did not find a fusion partner.
+      # --- Separate fused-species ivars (fallback) ---
       if fused.nil?
         [:@fusedSpecies, :@dexSpecies2, :@speciesFused, :@fused_species, :@species2].each do |var|
           if instance_variable_defined?(var)
@@ -672,6 +745,15 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
+      # Cross-check: log if @species differs from @dummyPokemon (stale-state detection)
+      if head && instance_variable_defined?(:@species)
+        ivar_sp = instance_variable_get(:@species)
+        if ivar_sp && ivar_sp != head
+          PokedexVoiceOver.log("  NOTE: @species=#{ivar_sp.inspect} differs from detected head=#{head.inspect} (stale ivar?)")
+        end
+      end
+
+      PokedexVoiceOver.log("  pokedex_vo_current_species => head=#{head.inspect}, fused=#{fused.inspect}")
       [head, fused]
     end
 
@@ -682,26 +764,38 @@ if defined?(PokemonPokedexInfo_Scene)
     # Tries multiple strategies since KIF/PIF versions may store the text
     # in different places.  Returns nil if the text cannot be determined
     # (the caller should fall back to random variant selection).
+    #
+    # Strategy order (most reliable first):
+    #   1. @dummyPokemon attributes (refreshed by pbUpdateDummyPokemon)
+    #   2. KIF-specific scene methods (getCustomDexEntry, etc.)
+    #   3. Instance variable scan (may be stale after navigation)
+    #   4. GameData lookups
+    #   5. pbGetMessage fallback
     def pokedex_vo_displayed_text
       text = nil
 
-      # Strategy 1a: Check common instance variable names for entry text
-      [:@dexEntry, :@entryText, :@description, :@pokemonEntry,
-       :@dex_entry, :@entry_text, :@fusionEntry, :@fusion_entry,
-       :@desc, :@dexentry, :@entrytext, :@pokedex_entry,
-       :@entry, :@dex_text, :@pokemon_entry].each do |var|
-        if instance_variable_defined?(var)
-          val = instance_variable_get(var)
-          if val.is_a?(String) && val.strip.length > 10
-            text = val
-            PokedexVoiceOver.log("  Displayed text found in #{var}")
-            break
+      # Strategy 1: @dummyPokemon (most reliable — refreshed each navigation)
+      if text.nil? && instance_variable_defined?(:@dummyPokemon)
+        dummy = @dummyPokemon
+        if dummy
+          [:pokedex_entry, :description, :real_description, :dex_entry,
+           :real_pokedex_entry, :entry_text, :dexentry].each do |attr|
+            next unless dummy.respond_to?(attr)
+            begin
+              val = dummy.send(attr)
+              if val.is_a?(String) && val.strip.length > 10
+                text = val
+                PokedexVoiceOver.log("  Displayed text found via @dummyPokemon.#{attr}")
+                break
+              end
+            rescue StandardError => e
+              PokedexVoiceOver.log("  @dummyPokemon.#{attr} failed: #{e.message}")
+            end
           end
         end
       end
 
-      # Strategy 1b: Try calling KIF-specific scene methods that return the
-      # entry text for the currently viewed Pokémon (including fusions).
+      # Strategy 2: KIF-specific scene methods (use current internal state)
       if text.nil?
         [:getCustomDexEntry, :getCustomEntryText, :getAIDexEntry].each do |method_name|
           next unless respond_to?(method_name, true)
@@ -725,22 +819,18 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
-      # Strategy 1c: Check @dummyPokemon (KIF creates this for dex views)
-      if text.nil? && instance_variable_defined?(:@dummyPokemon)
-        dummy = @dummyPokemon
-        if dummy
-          [:pokedex_entry, :description, :real_description, :dex_entry].each do |attr|
-            if dummy.respond_to?(attr)
-              begin
-                val = dummy.send(attr)
-                if val.is_a?(String) && val.strip.length > 10
-                  text = val
-                  PokedexVoiceOver.log("  Displayed text found via @dummyPokemon.#{attr}")
-                  break
-                end
-              rescue StandardError => e
-                PokedexVoiceOver.log("  @dummyPokemon.#{attr} failed: #{e.message}")
-              end
+      # Strategy 3: Check common instance variable names for entry text
+      if text.nil?
+        [:@dexEntry, :@entryText, :@description, :@pokemonEntry,
+         :@dex_entry, :@entry_text, :@fusionEntry, :@fusion_entry,
+         :@desc, :@dexentry, :@entrytext, :@pokedex_entry,
+         :@entry, :@dex_text, :@pokemon_entry].each do |var|
+          if instance_variable_defined?(var)
+            val = instance_variable_get(var)
+            if val.is_a?(String) && val.strip.length > 10
+              text = val
+              PokedexVoiceOver.log("  Displayed text found in #{var}")
+              break
             end
           end
         end
@@ -845,6 +935,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
         if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
+          @dex_vo_last_species = [head, fused]
           text = pokedex_vo_displayed_text
           PokedexVoiceOver.play(head, fused, text)
         else
@@ -934,13 +1025,18 @@ if defined?(PokemonPokedexInfo_Scene)
       alias dex_vo_orig_pbGoToNext pbGoToNext
 
       def pbGoToNext(*args)
+        prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToNext(*args)
 
         page = @page
-        PokedexVoiceOver.log("pbGoToNext fired — @page=#{page.inspect}")
+        PokedexVoiceOver.log("pbGoToNext fired — @page=#{page.inspect}, prev_species=#{prev_species.inspect}")
 
         if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
+          @dex_vo_last_species = [head, fused]
+          if head == prev_species&.first && fused == prev_species&.last
+            PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToNext — possible stale state")
+          end
           text = pokedex_vo_displayed_text
           PokedexVoiceOver.play(head, fused, text)
         end
@@ -954,13 +1050,18 @@ if defined?(PokemonPokedexInfo_Scene)
       alias dex_vo_orig_pbGoToPrevious pbGoToPrevious
 
       def pbGoToPrevious(*args)
+        prev_species = @dex_vo_last_species
         dex_vo_orig_pbGoToPrevious(*args)
 
         page = @page
-        PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{page.inspect}")
+        PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{page.inspect}, prev_species=#{prev_species.inspect}")
 
         if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
           head, fused = pokedex_vo_current_species
+          @dex_vo_last_species = [head, fused]
+          if head == prev_species&.first && fused == prev_species&.last
+            PokedexVoiceOver.log("  WARNING: species unchanged after pbGoToPrevious — possible stale state")
+          end
           text = pokedex_vo_displayed_text
           PokedexVoiceOver.play(head, fused, text)
         end
