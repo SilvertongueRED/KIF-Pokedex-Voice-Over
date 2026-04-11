@@ -1475,6 +1475,28 @@ def main(argv=None) -> int:
         except Exception as exc:
             log.warning("Could not write duration manifest %s: %s", durations_path, exc)
 
+    # ---- persist entry map (text → audio filename mapping) -----------------
+    # Maps audio file stems (e.g. "dex_RATTATA_HOOTHOOT_v2") to the Pokédex
+    # entry text that was used to generate the audio.  The mod uses this to
+    # match the currently displayed entry text to the correct audio variant.
+    entry_map: dict = {}
+    for filename, entry_text, dest in _all_pending_entries():
+        stem = dest.stem  # e.g. "dex_RATTATA_HOOTHOOT" or "dex_RATTATA_HOOTHOOT_v2"
+        entry_map[stem] = entry_text
+
+    if entry_map:
+        entry_map_path = output_dir / "dex_entry_map.json"
+        try:
+            with open(entry_map_path, "w", encoding="utf-8") as fh:
+                json.dump(entry_map, fh, indent=2, sort_keys=True)
+            log.info(
+                "Entry map written (%d entries): %s",
+                len(entry_map),
+                entry_map_path,
+            )
+        except Exception as exc:
+            log.warning("Could not write entry map %s: %s", entry_map_path, exc)
+
     # ---- persist failure log ------------------------------------------------
     try:
         if failure_log:
