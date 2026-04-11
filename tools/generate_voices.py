@@ -690,9 +690,12 @@ def _merge_json_data(
                 if not head_name:
                     continue
                 for body_key, body_val in val.items():
+                    body_num_m = re.match(r"(\d+)", body_key)
+                    if not body_num_m:
+                        continue
                     try:
-                        body_id = int(re.match(r"(\d+)", body_key).group(1))
-                    except (ValueError, AttributeError):
+                        body_id = int(body_num_m.group(1))
+                    except ValueError:
                         continue
                     body_name = id_map.get(body_id)
                     if not body_name:
