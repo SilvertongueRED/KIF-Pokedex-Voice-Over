@@ -371,10 +371,13 @@ module PokedexVoiceOver
     variants
   end
 
-  # Normalize text for comparison: strip, downcase, collapse whitespace.
+  # Normalize text for comparison: strip, downcase, remove all punctuation,
+  # and collapse whitespace.  Both the displayed text from KIF and the
+  # entry-map values go through this, so aggressively stripping punctuation
+  # and whitespace differences ensures they converge to the same form.
   def self._normalize_text(text)
     return "" unless text.is_a?(String)
-    text.strip.downcase.gsub(/\s+/, " ")
+    text.strip.downcase.gsub(/[^a-z0-9\s]/, "").gsub(/\s+/, " ").strip
   end
 
   # Given a list of variant bare names and the displayed entry text,
@@ -430,9 +433,11 @@ module PokedexVoiceOver
 
     # Word-overlap fallback — compare significant words (4+ chars) between
     # the displayed text and each entry map value.  Pick the variant with
-    # the highest overlap ratio.
+    # the highest overlap ratio.  Threshold lowered to 0.35 and minimum
+    # word count to 2 so fusion entries (which combine/modify words from
+    # both base species) can still match.
     displayed_words = norm_displayed.split(" ").select { |w| w.length >= 4 }.uniq
-    if displayed_words.length >= 3
+    if displayed_words.length >= 2
       best_variant = nil
       best_ratio = 0.0
       variants.each do |variant_bare|
@@ -449,14 +454,65 @@ module PokedexVoiceOver
           best_variant = variant_bare
         end
       end
-      if best_variant && best_ratio >= 0.5
+      if best_variant && best_ratio >= 0.35
         log("  _match_variant: word-overlap match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
+        return best_variant
+      end
+    end
+
+    # Fuzzy fallback — compare alphanumeric-only character sequences using
+    # longest-common-subsequence (LCS) ratio.  This catches differences in
+    # punctuation placement, minor word reordering, or small edits that the
+    # earlier strategies miss.
+    alpha_displayed = norm_displayed.gsub(/[^a-z0-9]/, "")
+    if alpha_displayed.length >= 20
+      best_variant = nil
+      best_ratio = 0.0
+      variants.each do |variant_bare|
+        stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+        map_text = entry_map[stem]
+        next unless map_text
+        alpha_map = _normalize_text(map_text).gsub(/[^a-z0-9]/, "")
+        next if alpha_map.empty?
+        ratio = _lcs_ratio(alpha_displayed, alpha_map)
+        if ratio > best_ratio
+          best_ratio = ratio
+          best_variant = variant_bare
+        end
+      end
+      if best_variant && best_ratio >= 0.85
+        log("  _match_variant: fuzzy LCS match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
         return best_variant
       end
     end
 
     log("  _match_variant: no match found")
     nil
+  end
+
+  # Longest-common-subsequence ratio between two strings.
+  # Returns a Float in 0.0..1.0 indicating similarity.
+  # Uses an optimised two-row DP to keep memory usage low.
+  def self._lcs_ratio(a, b)
+    return 1.0 if a == b
+    return 0.0 if a.empty? || b.empty?
+    # Ensure a is the shorter string for the two-row optimisation
+    a, b = b, a if a.length > b.length
+    prev = Array.new(a.length + 1, 0)
+    curr = Array.new(a.length + 1, 0)
+    b.length.times do |i|
+      a.length.times do |j|
+        if b[i] == a[j]
+          curr[j + 1] = prev[j] + 1
+        else
+          curr[j + 1] = curr[j] > prev[j + 1] ? curr[j] : prev[j + 1]
+        end
+      end
+      prev, curr = curr, prev
+      curr.fill(0)
+    end
+    lcs_len = prev[a.length]
+    lcs_len.to_f / [a.length, b.length].max
   end
 
   # Play a single audio file (bare_name is relative to Audio/SE/).
