@@ -811,6 +811,14 @@ if defined?(PokemonPokedexInfo_Scene)
   class PokemonPokedexInfo_Scene
     POKEDEX_VO_ENTRY_PAGE = 1   # page index that shows the Pokédex description (KIF uses 1-based pages)
 
+    # Helper: clear cached entry text ivars so KIF's drawEntryText
+    # regenerates @randomEntryText for the new species/fusion.
+    def dex_vo_clear_entry_text_caches
+      @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
+      @entryText = nil if instance_variable_defined?(:@entryText)
+      @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+    end
+
     # Helper: read the current species + fusion partner from scene state.
     #
     # Searches multiple sources in order of reliability after navigation:
@@ -1339,12 +1347,10 @@ if defined?(PokemonPokedexInfo_Scene)
         # drawEntryText (called inside dex_vo_orig_pbShowPage) regenerates
         # @randomEntryText for the new fusion instead of reusing the old one.
         if page == POKEDEX_VO_ENTRY_PAGE && instance_variable_defined?(:@index) && @index
-          current_entry = (@dexlist.is_a?(Array) && @dexlist[@index]) rescue nil
+          current_entry = @dexlist.is_a?(Array) && @index < @dexlist.length ? @dexlist[@index] : nil
           if current_entry && current_entry != @dex_vo_prev_drawn_entry
             @dex_vo_prev_drawn_entry = current_entry
-            @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
-            @entryText = nil if instance_variable_defined?(:@entryText)
-            @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+            dex_vo_clear_entry_text_caches
             PokedexVoiceOver.log("  pbShowPage: species entry changed — cleared @randomEntryText and related caches")
           end
         end
@@ -1395,12 +1401,10 @@ if defined?(PokemonPokedexInfo_Scene)
           # drawEntryText (called inside dex_vo_orig_drawPage) regenerates
           # @randomEntryText for the new fusion instead of reusing the old one.
           if page == POKEDEX_VO_ENTRY_PAGE && instance_variable_defined?(:@index) && @index
-            current_entry = (@dexlist.is_a?(Array) && @dexlist[@index]) rescue nil
+            current_entry = @dexlist.is_a?(Array) && @index < @dexlist.length ? @dexlist[@index] : nil
             if current_entry && current_entry != @dex_vo_prev_drawn_entry
               @dex_vo_prev_drawn_entry = current_entry
-              @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
-              @entryText = nil if instance_variable_defined?(:@entryText)
-              @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+              dex_vo_clear_entry_text_caches
               PokedexVoiceOver.log("  drawPage: species entry changed — cleared @randomEntryText and related caches")
             end
           end
@@ -1471,9 +1475,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
         # Clear cached entry text so drawPage/drawEntryText regenerates
         # @randomEntryText for the new species instead of reusing stale text.
-        @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
-        @entryText = nil if instance_variable_defined?(:@entryText)
-        @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+        dex_vo_clear_entry_text_caches
 
         PokedexVoiceOver.log("pbGoToNext fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
@@ -1501,9 +1503,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
         # Clear cached entry text so drawPage/drawEntryText regenerates
         # @randomEntryText for the new species instead of reusing stale text.
-        @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
-        @entryText = nil if instance_variable_defined?(:@entryText)
-        @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+        dex_vo_clear_entry_text_caches
 
         PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{@page.inspect}, prev_species=#{prev_species.inspect}")
 
