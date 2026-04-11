@@ -226,6 +226,35 @@ module PokedexVoiceOver
   end
 
   # -------------------------------------------------------------------------
+  # NB_POKEMON helper — cached lookup with multiple fallbacks
+  # -------------------------------------------------------------------------
+
+  def self.nb_pokemon
+    return @nb_pokemon if instance_variable_defined?(:@nb_pokemon) && @nb_pokemon
+    nb = nil
+    nb = NB_POKEMON if defined?(NB_POKEMON)
+    nb ||= (Settings::NB_POKEMON rescue nil) if defined?(Settings)
+    nb ||= (Pokemon::NB_POKEMON rescue nil) if defined?(Pokemon)
+    nb ||= (PBSpecies.maxValue rescue nil) if defined?(PBSpecies)
+    # Fallback: count GameData species entries (non-fusion max ID)
+    if nb.nil? && defined?(GameData::Species)
+      begin
+        max_id = 0
+        GameData::Species.each do |sp|
+          n = sp.id_number if sp.respond_to?(:id_number)
+          max_id = n if n.is_a?(Integer) && n > max_id && n < 10_000
+        end
+        nb = max_id if max_id > 0
+        log("  nb_pokemon via GameData scan: #{nb}") if nb
+      rescue StandardError => e
+        log("  nb_pokemon GameData scan failed: #{e.message}")
+      end
+    end
+    @nb_pokemon = nb if nb
+    nb
+  end
+
+  # -------------------------------------------------------------------------
   # Playback helpers
   # -------------------------------------------------------------------------
 
@@ -474,6 +503,19 @@ end
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
 #
+# KNOWN BUG FIXES (v1.7.0)
+# -------------------------
+# - Scrolling between Pokémon entries (pbGoToNext / pbGoToPrevious) now
+#   triggers voice-over playback for the newly displayed entry.  Previously
+#   only manually selecting a Pokémon via the action button would play.
+# - Fusion Pokédex entry text detection now uses KIF-specific scene methods
+#   (getCustomDexEntry, getCustomEntryText) and composite-ID GameData lookup,
+#   fixing fusions that were not read aloud or played the wrong variant.
+# - NB_POKEMON detection now uses a centralized helper with additional
+#   fallbacks (Settings::NB_POKEMON, GameData species scan) so fusion
+#   species decomposition works in more KIF builds.
+# - @dummyPokemon is now checked as a text source for dex entry text.
+#
 # KNOWN BUG FIXES (v1.6.0)
 # -------------------------
 # - Variant audio selection now matches the displayed Pokédex entry text
@@ -598,10 +640,7 @@ if defined?(PokemonPokedexInfo_Scene)
       # Check for this pattern BEFORE looking for separate fused-species ivars.
       fused = nil
       if head.is_a?(Integer) && head > 0
-        nb_pokemon = nil
-        nb_pokemon = NB_POKEMON if defined?(NB_POKEMON)
-        nb_pokemon ||= (Pokemon::NB_POKEMON rescue nil) if defined?(Pokemon)
-        nb_pokemon ||= (PBSpecies.maxValue rescue nil) if defined?(PBSpecies)
+        nb_pokemon = PokedexVoiceOver.nb_pokemon
 
         if nb_pokemon && nb_pokemon > 0 && head > nb_pokemon
           body_id = head % nb_pokemon
@@ -642,7 +681,7 @@ if defined?(PokemonPokedexInfo_Scene)
     def pokedex_vo_displayed_text
       text = nil
 
-      # Strategy 1: Check common instance variable names for entry text
+      # Strategy 1a: Check common instance variable names for entry text
       [:@dexEntry, :@entryText, :@description, :@pokemonEntry,
        :@dex_entry, :@entry_text, :@fusionEntry, :@fusion_entry,
        :@desc, :@dexentry, :@entrytext, :@pokedex_entry,
@@ -657,10 +696,84 @@ if defined?(PokemonPokedexInfo_Scene)
         end
       end
 
-      # Strategy 2: For regular (non-fused) species, try GameData
+      # Strategy 1b: Try calling KIF-specific scene methods that return the
+      # entry text for the currently viewed Pokémon (including fusions).
       if text.nil?
+        [:getCustomDexEntry, :getCustomEntryText, :getAIDexEntry].each do |method_name|
+          next unless respond_to?(method_name, true)
+          begin
+            val = send(method_name)
+            if val.is_a?(String) && val.strip.length > 10
+              text = val
+              PokedexVoiceOver.log("  Displayed text found via #{method_name}()")
+              break
+            elsif val.is_a?(Array)
+              str = val.find { |v| v.is_a?(String) && v.strip.length > 10 }
+              if str
+                text = str
+                PokedexVoiceOver.log("  Displayed text found via #{method_name}() (array)")
+                break
+              end
+            end
+          rescue StandardError => e
+            PokedexVoiceOver.log("  #{method_name}() call failed: #{e.message}")
+          end
+        end
+      end
+
+      # Strategy 1c: Check @dummyPokemon (KIF creates this for dex views)
+      if text.nil? && instance_variable_defined?(:@dummyPokemon)
+        dummy = @dummyPokemon
+        if dummy
+          [:pokedex_entry, :description, :real_description, :dex_entry].each do |attr|
+            if dummy.respond_to?(attr)
+              begin
+                val = dummy.send(attr)
+                if val.is_a?(String) && val.strip.length > 10
+                  text = val
+                  PokedexVoiceOver.log("  Displayed text found via @dummyPokemon.#{attr}")
+                  break
+                end
+              rescue StandardError => e
+                PokedexVoiceOver.log("  @dummyPokemon.#{attr} failed: #{e.message}")
+              end
+            end
+          end
+        end
+      end
+
+      # Strategy 2: Try GameData for both regular and fused species
+      if text.nil? && defined?(GameData::Species)
         head, fused = pokedex_vo_current_species
-        if head && fused.nil? && defined?(GameData::Species)
+
+        # For fusions, try the composite species ID first — KIF registers
+        # fusion entries under the composite key in GameData::Species.
+        if head && fused
+          nb = PokedexVoiceOver.nb_pokemon
+          composite = nil
+          if nb && nb > 0 && head.is_a?(Integer) && fused.is_a?(Integer)
+            composite = head * nb + fused
+          end
+          if composite
+            begin
+              data = GameData::Species.get(composite)
+              if data.respond_to?(:pokedex_entry)
+                val = data.pokedex_entry
+                text = val if val.is_a?(String) && val.strip.length > 10
+              end
+              if text.nil? && data.respond_to?(:real_description)
+                val = data.real_description
+                text = val if val.is_a?(String) && val.strip.length > 10
+              end
+              PokedexVoiceOver.log("  Displayed text found via GameData (composite #{composite})") if text
+            rescue StandardError => e
+              PokedexVoiceOver.log("  GameData composite lookup failed: #{e.message}")
+            end
+          end
+        end
+
+        # For regular species, or if fusion composite lookup failed
+        if text.nil? && head
           begin
             data = GameData::Species.get(head)
             if data.respond_to?(:real_description)
@@ -806,6 +919,50 @@ if defined?(PokemonPokedexInfo_Scene)
       end
     else
       PokedexVoiceOver.log("  WARNING: pbEndScene is NOT defined — cannot hook scene close")
+    end
+
+    # ------------------------------------------------------------------
+    # pbGoToNext / pbGoToPrevious — play voice when scrolling between
+    # Pokémon entries in the Pokédex info scene
+    # ------------------------------------------------------------------
+    if method_defined?(:pbGoToNext)
+      PokedexVoiceOver.log("  Aliasing pbGoToNext")
+      alias dex_vo_orig_pbGoToNext pbGoToNext
+
+      def pbGoToNext(*args)
+        dex_vo_orig_pbGoToNext(*args)
+
+        page = @page
+        PokedexVoiceOver.log("pbGoToNext fired — @page=#{page.inspect}")
+
+        if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
+          head, fused = pokedex_vo_current_species
+          text = pokedex_vo_displayed_text
+          PokedexVoiceOver.play(head, fused, text)
+        end
+      end
+    else
+      PokedexVoiceOver.log("  WARNING: pbGoToNext is NOT defined — cannot hook next-entry navigation")
+    end
+
+    if method_defined?(:pbGoToPrevious)
+      PokedexVoiceOver.log("  Aliasing pbGoToPrevious")
+      alias dex_vo_orig_pbGoToPrevious pbGoToPrevious
+
+      def pbGoToPrevious(*args)
+        dex_vo_orig_pbGoToPrevious(*args)
+
+        page = @page
+        PokedexVoiceOver.log("pbGoToPrevious fired — @page=#{page.inspect}")
+
+        if page.nil? || page == POKEDEX_VO_ENTRY_PAGE
+          head, fused = pokedex_vo_current_species
+          text = pokedex_vo_displayed_text
+          PokedexVoiceOver.play(head, fused, text)
+        end
+      end
+    else
+      PokedexVoiceOver.log("  WARNING: pbGoToPrevious is NOT defined — cannot hook previous-entry navigation")
     end
   end
 
