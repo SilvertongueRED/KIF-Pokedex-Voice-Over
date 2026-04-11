@@ -225,12 +225,16 @@ module PokedexVoiceOver
     return species.to_s.upcase
   end
 
+  # Upper bound for "regular" (non-fusion) species IDs when scanning GameData.
+  # Fusion composite IDs (head * NB_POKEMON + body) are well above this.
+  MAX_BASE_SPECIES_ID = 10_000
+
   # -------------------------------------------------------------------------
   # NB_POKEMON helper — cached lookup with multiple fallbacks
   # -------------------------------------------------------------------------
 
   def self.nb_pokemon
-    return @nb_pokemon if instance_variable_defined?(:@nb_pokemon) && @nb_pokemon
+    return @nb_pokemon if @nb_pokemon
     nb = nil
     nb = NB_POKEMON if defined?(NB_POKEMON)
     nb ||= (Settings::NB_POKEMON rescue nil) if defined?(Settings)
@@ -242,7 +246,7 @@ module PokedexVoiceOver
         max_id = 0
         GameData::Species.each do |sp|
           n = sp.id_number if sp.respond_to?(:id_number)
-          max_id = n if n.is_a?(Integer) && n > max_id && n < 10_000
+          max_id = n if n.is_a?(Integer) && n > max_id && n < MAX_BASE_SPECIES_ID
         end
         nb = max_id if max_id > 0
         log("  nb_pokemon via GameData scan: #{nb}") if nb
