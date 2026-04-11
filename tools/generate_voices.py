@@ -484,6 +484,240 @@ def parse_kif_fusion_json(game_dir: Path, id_map: dict) -> tuple[dict, dict]:
     return primary_entries, variant_entries
 
 
+def _parse_pokedex_json_records(
+    records: list, id_map: dict, source_name: str
+) -> dict:
+    """Parse a list of dex.json-style records into ``{(SP1, SP2): [texts]}``."""
+    all_per_pair: dict = {}
+
+    for rec in records:
+        if not isinstance(rec, dict):
+            continue
+        sprite = rec.get("sprite", "")
+        raw_entry = rec.get("entry", "")
+        if not raw_entry:
+            # Some JSON files use "text", "description", or "dex_entry"
+            raw_entry = (
+                rec.get("text", "")
+                or rec.get("description", "")
+                or rec.get("dex_entry", "")
+                or rec.get("pokedex_entry", "")
+            )
+        entry_text = _clean_entry_text(raw_entry)
+        if not entry_text:
+            continue
+
+        # Try to extract head/body pair from sprite name
+        if sprite:
+            base = sprite.rsplit(".png", 1)[0] if sprite.endswith(".png") else sprite
+            parts = base.split(".", 1)
+            if len(parts) == 2:
+                try:
+                    head_id = int(parts[0])
+                    body_num = re.match(r"(\d+)", parts[1])
+                    if body_num:
+                        body_id = int(body_num.group(1))
+                        head_name = id_map.get(head_id)
+                        body_name = id_map.get(body_id)
+                        if head_name and body_name:
+                            pair = (head_name, body_name)
+                            if pair not in all_per_pair:
+                                all_per_pair[pair] = []
+                            if entry_text not in all_per_pair[pair]:
+                                all_per_pair[pair].append(entry_text)
+                            continue
+                except ValueError:
+                    pass
+
+        # Fallback: try "name" or "species" fields with underscore separator
+        name_field = rec.get("name", "") or rec.get("species", "")
+        if name_field and "_" in name_field:
+            parts = name_field.upper().split("_", 1)
+            if len(parts) == 2:
+                pair = (parts[0], parts[1])
+                if pair not in all_per_pair:
+                    all_per_pair[pair] = []
+                if entry_text not in all_per_pair[pair]:
+                    all_per_pair[pair].append(entry_text)
+
+    if all_per_pair:
+        total = sum(len(v) for v in all_per_pair.values())
+        log.info("  Parsed %d texts across %d pairs from %s", total, len(all_per_pair), source_name)
+    return all_per_pair
+
+
+def parse_all_pokedex_json_files(
+    game_dir: Path, id_map: dict
+) -> tuple[dict, dict]:
+    """
+    Scan ALL JSON files in ``Data/pokedex/`` and any additional KIF data
+    directories for fusion Pokédex entries.
+
+    Goes beyond just ``dex.json`` to capture entries from every JSON file
+    KIF might store dex text in — including AI-generated entries, custom
+    entries, and variant-specific files.
+
+    Returns the same ``(primary, variants)`` tuple as
+    :func:`parse_kif_fusion_json`.
+    """
+    all_per_pair: dict = {}
+
+    # Directories KIF may store Pokédex entry JSON files in
+    candidate_dirs = [
+        game_dir / "Data" / "pokedex",
+        game_dir / "Data" / "dex_entries",
+        game_dir / "Data" / "pokemon_dex_entries",
+        game_dir / "Data" / "custom_dex",
+        game_dir / "Data" / "fusion_entries",
+    ]
+
+    # Also check root-level Data/ JSON files that might contain dex entries
+    candidate_files = [
+        game_dir / "Data" / "custom_dex_entries.json",
+        game_dir / "Data" / "ai_dex_entries.json",
+        game_dir / "Data" / "fusion_dex_entries.json",
+    ]
+
+    # Scan directories for all JSON files
+    for dir_path in candidate_dirs:
+        if not dir_path.is_dir():
+            continue
+        for json_file in sorted(dir_path.glob("*.json")):
+            # Skip dex.json — already parsed by parse_kif_fusion_json
+            if json_file.name == "dex.json" and dir_path.name == "pokedex":
+                continue
+            log.info("Scanning additional dex JSON: %s", json_file)
+            try:
+                content = json_file.read_text(encoding="utf-8", errors="replace")
+                data = json.loads(content)
+            except (OSError, json.JSONDecodeError) as exc:
+                log.debug("Cannot parse %s: %s", json_file, exc)
+                continue
+
+            _merge_json_data(data, id_map, json_file.name, all_per_pair)
+
+    # Check individual files
+    for json_file in candidate_files:
+        if not json_file.is_file():
+            continue
+        log.info("Scanning additional dex JSON: %s", json_file)
+        try:
+            content = json_file.read_text(encoding="utf-8", errors="replace")
+            data = json.loads(content)
+        except (OSError, json.JSONDecodeError) as exc:
+            log.debug("Cannot parse %s: %s", json_file, exc)
+            continue
+
+        _merge_json_data(data, id_map, json_file.name, all_per_pair)
+
+    # Split into primary and variant dicts
+    primary: dict = {}
+    variants: dict = {}
+    for pair, texts in all_per_pair.items():
+        primary[pair] = texts[0]
+        if len(texts) > 1:
+            variants[pair] = texts[1:]
+
+    if primary:
+        total_variants = sum(len(v) for v in variants.values())
+        log.info(
+            "Additional JSON scan: %d fusion pairs (%d variant texts)",
+            len(primary),
+            total_variants,
+        )
+    return primary, variants
+
+
+def _merge_json_data(
+    data, id_map: dict, source_name: str, all_per_pair: dict
+) -> None:
+    """Parse JSON data (list or dict) and merge results into *all_per_pair*."""
+    if isinstance(data, list):
+        # dex.json-style: list of {sprite, entry} records
+        parsed = _parse_pokedex_json_records(data, id_map, source_name)
+        for pair, texts in parsed.items():
+            if pair not in all_per_pair:
+                all_per_pair[pair] = []
+            for t in texts:
+                if t not in all_per_pair[pair]:
+                    all_per_pair[pair].append(t)
+
+    elif isinstance(data, dict):
+        # Key-value format: {"HEAD_BODY": "entry text"} or
+        # {"HEAD_BODY": ["text1", "text2"]} or
+        # nested {"head_id": {"body_id": "text"}}
+        for key, val in data.items():
+            if isinstance(val, str) and "_" in key:
+                entry_text = _clean_entry_text(val)
+                if entry_text and len(entry_text) > 10:
+                    parts = key.upper().split("_", 1)
+                    if len(parts) == 2:
+                        pair = (parts[0], parts[1])
+                        if pair not in all_per_pair:
+                            all_per_pair[pair] = []
+                        if entry_text not in all_per_pair[pair]:
+                            all_per_pair[pair].append(entry_text)
+            elif isinstance(val, list) and "_" in key:
+                parts = key.upper().split("_", 1)
+                if len(parts) != 2:
+                    continue
+                pair = (parts[0], parts[1])
+                if pair not in all_per_pair:
+                    all_per_pair[pair] = []
+                for item in val:
+                    if isinstance(item, str):
+                        entry_text = _clean_entry_text(item)
+                        if entry_text and len(entry_text) > 10:
+                            if entry_text not in all_per_pair[pair]:
+                                all_per_pair[pair].append(entry_text)
+                    elif isinstance(item, dict):
+                        raw = (
+                            item.get("entry", "")
+                            or item.get("text", "")
+                            or item.get("description", "")
+                        )
+                        entry_text = _clean_entry_text(raw)
+                        if entry_text and len(entry_text) > 10:
+                            if entry_text not in all_per_pair[pair]:
+                                all_per_pair[pair].append(entry_text)
+            elif isinstance(val, dict):
+                # Nested format: {"163": {"19": "text", ...}}
+                try:
+                    head_id = int(key)
+                except ValueError:
+                    continue
+                head_name = id_map.get(head_id)
+                if not head_name:
+                    continue
+                for body_key, body_val in val.items():
+                    body_num_m = re.match(r"(\d+)", body_key)
+                    if not body_num_m:
+                        continue
+                    try:
+                        body_id = int(body_num_m.group(1))
+                    except ValueError:
+                        continue
+                    body_name = id_map.get(body_id)
+                    if not body_name:
+                        continue
+                    pair = (head_name, body_name)
+                    if pair not in all_per_pair:
+                        all_per_pair[pair] = []
+                    if isinstance(body_val, str):
+                        raw = body_val
+                    elif isinstance(body_val, dict):
+                        raw = (
+                            body_val.get("entry", "")
+                            or body_val.get("text", "")
+                        )
+                    else:
+                        raw = ""
+                    entry_text = _clean_entry_text(raw)
+                    if entry_text and len(entry_text) > 10:
+                        if entry_text not in all_per_pair[pair]:
+                            all_per_pair[pair].append(entry_text)
+
+
 # ---------------------------------------------------------------------------
 # Registration.rb parsing (Data/Scripts/990_NPT/001_Registration.rb etc.)
 # ---------------------------------------------------------------------------
@@ -1361,6 +1595,46 @@ def main(argv=None) -> int:
             fusion_entries, fusion_variant_entries = parse_kif_fusion_json(game_dir, species_id_map)
         if not fusion_entries:
             fusion_entries = parse_fusion_entries(game_dir)
+
+        # Solution 1 & 4: parse ALL additional JSON files in Data/pokedex/
+        # and other KIF data directories for fusion entries we might have
+        # missed.  Merge into the existing entries, adding new pairs and
+        # collecting additional variant texts for existing pairs.
+        if species_id_map:
+            extra_primary, extra_variants = parse_all_pokedex_json_files(
+                game_dir, species_id_map
+            )
+            for pair, text in extra_primary.items():
+                if pair not in fusion_entries:
+                    fusion_entries[pair] = text
+                elif text != fusion_entries[pair]:
+                    # Different text for known pair → add as variant
+                    if pair not in fusion_variant_entries:
+                        fusion_variant_entries[pair] = []
+                    if text not in fusion_variant_entries[pair]:
+                        fusion_variant_entries[pair].append(text)
+            for pair, texts in extra_variants.items():
+                if pair not in fusion_variant_entries:
+                    fusion_variant_entries[pair] = []
+                for t in texts:
+                    if (
+                        t not in fusion_variant_entries[pair]
+                        and t != fusion_entries.get(pair)
+                    ):
+                        fusion_variant_entries[pair].append(t)
+
+        # Also merge PBS fusion entries as additional variants when both
+        # sources have text for the same pair but with different content.
+        pbs_fusions = parse_fusion_entries(game_dir)
+        for pair, text in pbs_fusions.items():
+            if pair not in fusion_entries:
+                fusion_entries[pair] = text
+            elif text != fusion_entries[pair]:
+                if pair not in fusion_variant_entries:
+                    fusion_variant_entries[pair] = []
+                if text not in fusion_variant_entries[pair]:
+                    fusion_variant_entries[pair].append(text)
+
         if not fusion_entries and not args.retry_failed:
             log.info(
                 "No fusion Pokédex entries found.  "

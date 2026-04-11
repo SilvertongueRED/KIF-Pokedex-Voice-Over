@@ -873,6 +873,7 @@ if defined?(PokemonPokedexInfo_Scene)
       @randomEntryText = nil if instance_variable_defined?(:@randomEntryText)
       @entryText = nil if instance_variable_defined?(:@entryText)
       @dexEntry = nil if instance_variable_defined?(:@dexEntry)
+      @dex_vo_captured_text = nil  # clear captured drawEntryText text too
     end
 
     # Helper: read the current species + fusion partner from scene state.
@@ -1052,6 +1053,18 @@ if defined?(PokemonPokedexInfo_Scene)
     #   5.   pbGetMessage fallback
     def pokedex_vo_displayed_text
       text = nil
+
+      # Strategy 0: @dex_vo_captured_text (captured directly from drawEntryText hook)
+      # This is the EXACT text KIF generated/displayed — the most reliable
+      # source because it's intercepted at the moment of text generation,
+      # before any caching, stale state, or method argument issues.
+      if instance_variable_defined?(:@dex_vo_captured_text) && @dex_vo_captured_text
+        val = @dex_vo_captured_text
+        if val.is_a?(String) && val.strip.length > 10
+          text = val
+          PokedexVoiceOver.log("  Displayed text found via @dex_vo_captured_text (drawEntryText hook)")
+        end
+      end
 
       # Strategy 1: @dummyPokemon (most reliable — refreshed each navigation)
       if text.nil? && instance_variable_defined?(:@dummyPokemon)
@@ -1575,6 +1588,78 @@ if defined?(PokemonPokedexInfo_Scene)
       end
     else
       PokedexVoiceOver.log("  WARNING: pbGoToPrevious is NOT defined — cannot hook previous-entry navigation")
+    end
+
+    # ------------------------------------------------------------------
+    # drawEntryText — capture the exact text KIF generates for the entry
+    # ------------------------------------------------------------------
+    # KIF's drawEntryText is the method that sets @randomEntryText to the
+    # text it will actually display on screen.  By hooking it we capture
+    # the EXACT text at the moment it's produced, avoiding any stale-
+    # cache or method-argument issues that plague other text-detection
+    # strategies.
+    #
+    # We also hook getCustomEntryText, getCustomDexEntry, and
+    # getAIDexEntry — the individual text-generation methods KIF may call
+    # internally — to capture text at the source.
+    if method_defined?(:drawEntryText)
+      PokedexVoiceOver.log("  Aliasing drawEntryText (text capture hook)")
+      alias dex_vo_orig_drawEntryText drawEntryText
+
+      def drawEntryText(*args)
+        dex_vo_orig_drawEntryText(*args)
+
+        # After KIF has generated and set the text, capture it
+        if instance_variable_defined?(:@randomEntryText)
+          val = instance_variable_get(:@randomEntryText)
+          if val.is_a?(String) && val.strip.length > 10
+            @dex_vo_captured_text = val.dup
+            PokedexVoiceOver.log("  drawEntryText hook: captured text (#{val.length} chars): #{val[0, 60].inspect}")
+          end
+        end
+        # Also check @entryText as a fallback — some KIF builds set this instead
+        if @dex_vo_captured_text.nil? && instance_variable_defined?(:@entryText)
+          val = instance_variable_get(:@entryText)
+          if val.is_a?(String) && val.strip.length > 10
+            @dex_vo_captured_text = val.dup
+            PokedexVoiceOver.log("  drawEntryText hook: captured text from @entryText (#{val.length} chars)")
+          end
+        end
+      end
+    else
+      PokedexVoiceOver.log("  drawEntryText is NOT defined — text capture hook unavailable (matching may be less reliable)")
+    end
+
+    # Hook individual text-generation methods to capture text at the source.
+    # These return the text KIF will display — capturing the return value
+    # gives us the exact text even if drawEntryText isn't hookable.
+    [:getCustomEntryText, :getCustomDexEntry, :getAIDexEntry].each do |mname|
+      next unless method_defined?(mname)
+      PokedexVoiceOver.log("  Wrapping #{mname} (text capture)")
+
+      # Use alias_method to create a named original-method alias, then
+      # redefine the method to capture its return value.
+      orig_name = :"dex_vo_orig_#{mname}"
+      alias_method orig_name, mname
+
+      define_method(mname) do |*args|
+        result = send(orig_name, *args)
+        begin
+          captured = nil
+          if result.is_a?(String) && result.strip.length > 10
+            captured = result
+          elsif result.is_a?(Array)
+            captured = result.find { |v| v.is_a?(String) && v.strip.length > 10 }
+          end
+          if captured
+            @dex_vo_captured_text = captured.dup
+            PokedexVoiceOver.log("  #{mname} hook: captured text (#{captured.length} chars): #{captured[0, 60].inspect}")
+          end
+        rescue StandardError => e
+          PokedexVoiceOver.log("  #{mname} hook capture error: #{e.message}")
+        end
+        result
+      end
     end
   end
 
