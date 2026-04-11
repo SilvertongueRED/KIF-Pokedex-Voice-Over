@@ -50,7 +50,7 @@ module PokedexVoiceOver
 
   # Delay (seconds) before voice-over playback begins, allowing the Pokémon's
   # cry to finish before the Pokédex entry is read aloud.
-  CRY_DELAY = 0.5
+  CRY_DELAY = 1.0
 
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
@@ -835,11 +835,12 @@ if defined?(PokemonPokedexInfo_Scene)
     # (the caller should fall back to random variant selection).
     #
     # Strategy order (most reliable first):
-    #   1. @dummyPokemon attributes (refreshed by pbUpdateDummyPokemon)
-    #   2. KIF-specific scene methods (getCustomDexEntry, etc.)
-    #   3. Instance variable scan (may be stale after navigation)
-    #   4. GameData lookups
-    #   5. pbGetMessage fallback
+    #   1.   @dummyPokemon attributes (refreshed by pbUpdateDummyPokemon)
+    #   1.5  @randomEntryText (KIF stores randomly-chosen fusion entry text)
+    #   2.   KIF-specific scene methods (getCustomDexEntry, etc.)
+    #   3.   Instance variable scan (may be stale after navigation)
+    #   4.   GameData lookups
+    #   5.   pbGetMessage fallback
     def pokedex_vo_displayed_text
       text = nil
 
@@ -861,6 +862,19 @@ if defined?(PokemonPokedexInfo_Scene)
               PokedexVoiceOver.log("  @dummyPokemon.#{attr} failed: #{e.message}")
             end
           end
+        end
+      end
+
+      # Strategy 1.5: @randomEntryText (KIF stores randomly-chosen fusion entry text here)
+      # KIF's drawEntryText sets @randomEntryText to the text it actually displays
+      # for generated fusion entries.  After navigation, the game sets this to nil
+      # before drawEntryText re-assigns it, so a nil value here simply means the
+      # text hasn't been set yet — the nil/length guard below handles that case.
+      if text.nil? && instance_variable_defined?(:@randomEntryText)
+        val = instance_variable_get(:@randomEntryText)
+        if val.is_a?(String) && val.strip.length > 10
+          text = val
+          PokedexVoiceOver.log("  Displayed text found via @randomEntryText")
         end
       end
 
@@ -896,12 +910,39 @@ if defined?(PokemonPokedexInfo_Scene)
           # Build a list of argument sets to try (most specific first)
           arg_sets = []
           if method_name == :getAIDexEntry
-            # getAIDexEntry expects (head, body) for fusions
-            arg_sets << [kif_head, kif_fused] if kif_head && kif_fused
-            arg_sets << [kif_composite] if kif_composite
-            arg_sets << [kif_head] if kif_head
+            # getAIDexEntry expects (pokemonID, name) — always pass 2 args
+            if kif_head && kif_fused
+              begin
+                species_data = GameData::Species.get(kif_composite || kif_head)
+                arg_sets << [kif_head, species_data.name]
+              rescue StandardError; end
+            end
+            if kif_composite
+              begin
+                species_data = GameData::Species.get(kif_composite)
+                arg_sets << [kif_composite, species_data.name]
+              rescue StandardError; end
+            end
+            if kif_head
+              begin
+                species_data = GameData::Species.get(kif_head)
+                arg_sets << [kif_head, species_data.name]
+              rescue StandardError; end
+            end
+          elsif method_name == :getCustomEntryText
+            # getCustomEntryText expects a GameData::Species object
+            if kif_composite
+              begin
+                arg_sets << [GameData::Species.get(kif_composite)]
+              rescue StandardError; end
+            end
+            if kif_head
+              begin
+                arg_sets << [GameData::Species.get(kif_head)]
+              rescue StandardError; end
+            end
           else
-            # getCustomDexEntry / getCustomEntryText expect (species)
+            # getCustomDexEntry — try raw IDs (composite first, then head)
             arg_sets << [kif_composite] if kif_composite
             arg_sets << [kif_head] if kif_head
           end
@@ -934,7 +975,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
       # Strategy 3: Check common instance variable names for entry text
       if text.nil?
-        [:@dexEntry, :@entryText, :@description, :@pokemonEntry,
+        [:@randomEntryText, :@dexEntry, :@entryText, :@description, :@pokemonEntry,
          :@dex_entry, :@entry_text, :@fusionEntry, :@fusion_entry,
          :@desc, :@dexentry, :@entrytext, :@pokedex_entry,
          :@entry, :@dex_text, :@pokemon_entry].each do |var|
