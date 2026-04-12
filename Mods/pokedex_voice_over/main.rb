@@ -428,15 +428,110 @@ module PokedexVoiceOver
     text.strip.downcase.gsub(/[^a-z0-9\s]/, "").gsub(/\s+/, " ").strip
   end
 
+  # Generate a portmanteau fusion name the way KIF does at runtime.
+  # Takes roughly the first half of the head name (ceil) and the last half
+  # of the body name (floor) and concatenates them.
+  # Example: "Bulbasaur" + "Charmander" => "Bulbander"
+  def self._make_fusion_name(head_name, body_name)
+    head = head_name.to_s.strip
+    body = body_name.to_s.strip
+    return (head.empty? ? body : head) if head.empty? || body.empty?
+
+    head = head[0].upcase + head[1..] if head.length > 0
+    body = body[0].upcase + body[1..] if body.length > 0
+
+    head_split = (head.length / 2.0).ceil
+    body_split = body.length / 2
+
+    head_part = head[0, head_split]
+    body_part = body[body_split..]
+
+    head_part + body_part.downcase
+  end
+
+  # Try to look up a custom fused name from Data/custom_fused_pokemon_names.tsv
+  # (or .txt).  Returns the custom name string or nil if not found.
+  # head_species and body_species should be species identifiers (Symbol, Integer, or String).
+  def self._lookup_custom_fused_name(head_species, body_species)
+    @custom_fused_names ||= _load_custom_fused_names
+    return nil if @custom_fused_names.empty?
+
+    head_str = species_str(head_species)
+    body_str = species_str(body_species)
+    return nil unless head_str && body_str
+
+    @custom_fused_names["#{head_str.upcase}\t#{body_str.upcase}"]
+  end
+
+  # Load KIF's Data/custom_fused_pokemon_names.tsv (or .txt) into a lookup hash.
+  # Keys are "HEAD_SPECIES\tBODY_SPECIES" (uppercase), values are custom names.
+  # Uses nb_pokemon-based ID-to-species resolution via GameData when available.
+  def self._load_custom_fused_names
+    names = {}
+    candidates = [
+      "Data/custom_fused_pokemon_names.tsv",
+      "Data/custom_fused_pokemon_names.txt"
+    ]
+    path = candidates.find { |p| File.exist?(p) rescue false }
+    return names unless path
+
+    log("Loading custom fused names from #{path}")
+    begin
+      File.foreach(path) do |line|
+        line = line.strip
+        next if line.empty? || line.start_with?("#")
+        parts = line.split("\t")
+        next if parts.length < 3
+        head_num = parts[0].strip.to_i
+        body_num = parts[1].strip.to_i
+        fused_name = parts[2].strip
+        next if fused_name.empty? || head_num <= 0 || body_num <= 0
+
+        # Resolve dex numbers to species names via GameData if available
+        head_name = nil
+        body_name = nil
+        begin
+          if defined?(GameData::Species)
+            hd = GameData::Species.try_get(head_num)
+            bd = GameData::Species.try_get(body_num)
+            head_name = hd.id.to_s.upcase if hd && hd.respond_to?(:id)
+            body_name = bd.id.to_s.upcase if bd && bd.respond_to?(:id)
+          end
+        rescue StandardError
+          # GameData not available — skip this entry
+        end
+
+        if head_name && body_name
+          names["#{head_name}\t#{body_name}"] = fused_name
+        end
+      end
+    rescue StandardError => e
+      log("WARNING: Failed to load custom fused names: #{e.message}")
+    end
+    log("Loaded #{names.size} custom fused names")
+    names
+  end
+
   # Replace the literal POKENAME placeholder in entry text with the
-  # title-cased species names that KIF substitutes at runtime.
+  # fusion's actual fused name — using custom name data if available,
+  # falling back to a portmanteau algorithm.
   # Returns the original text unchanged if POKENAME is not present.
   def self._resolve_pokename(text, head_species, body_species)
     return text unless text && text =~ /POKENAME/i
     head_name = species_str(head_species)
     body_name = species_str(body_species)
     return text unless head_name && body_name
-    display_name = "#{head_name.capitalize} #{body_name.capitalize}"
+
+    # 1. Try custom fused name from Data/custom_fused_pokemon_names.tsv
+    display_name = _lookup_custom_fused_name(head_species, body_species)
+    if display_name
+      log("  POKENAME resolved via custom name: #{head_name} + #{body_name} => #{display_name}")
+    else
+      # 2. Fall back to portmanteau algorithm
+      display_name = _make_fusion_name(head_name, body_name)
+      log("  POKENAME resolved via portmanteau: #{head_name} + #{body_name} => #{display_name}")
+    end
+
     text.gsub(/POKENAME/i, display_name)
   end
 
