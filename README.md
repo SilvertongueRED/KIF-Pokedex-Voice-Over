@@ -325,7 +325,7 @@ TTS audio is saved without effects.
 | gTTS fails | Check your internet connection |
 | Voice cuts off mid-sentence | Normal for the ME channel — the full file plays but in-game ME events can interrupt it |
 | Mod not loading | Ensure `Mods/pokedex_voice_over/mod.json` and `main.rb` are both present |
-| Game crashes on launch with `require` error | This is handled automatically — the mod uses a safe `require "json"` with a built-in fallback JSON parser since KIF's MKXP-EX runtime does not include the `json` standard library. |
+| Game crashes on launch with `require "json"` error | Update to the latest version of the mod.  Older versions used a bare `require "json"` which crashes on KIF's MKXP-EX runtime.  The current version includes a built-in fallback JSON parser that handles this automatically. |
 
 ---
 
