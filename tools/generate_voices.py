@@ -97,6 +97,7 @@ Requirements
 import argparse
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -202,17 +203,135 @@ def _clean_entry_text(raw: str) -> str:
 _POKENAME_RE = re.compile(r"POKENAME", re.IGNORECASE)
 
 
-def _resolve_pokename(text: str, head_name: str, body_name: str) -> str:
-    """Replace the literal ``POKENAME`` placeholder with title-cased species names.
+# ---------------------------------------------------------------------------
+# Custom fused-name data + portmanteau algorithm
+# ---------------------------------------------------------------------------
 
-    KIF's game engine performs this substitution at runtime, but the raw
-    dex-entry text files contain the literal placeholder.  We resolve it
-    before TTS so the audio says the actual fusion name (e.g.
-    ``"Hoothoot Rattata"``) instead of the word "POKENAME".
+def parse_custom_fused_names(
+    game_dir: Path, species_id_map: dict
+) -> dict:
+    """Parse KIF's ``Data/custom_fused_pokemon_names`` file.
+
+    The file is tab-separated with rows of the form::
+
+        head_dex_number<TAB>body_dex_number<TAB>CustomFusionName
+
+    Returns a ``{("HEAD_SPECIES", "BODY_SPECIES"): "FusedName"}`` dict
+    keyed by **uppercase** species name pairs (matching the convention used
+    elsewhere in this script).  *species_id_map* maps dex numbers to
+    species names and is required to translate the numeric IDs in the file.
+    """
+    custom_names: dict = {}
+
+    candidates = [
+        game_dir / "Data" / "custom_fused_pokemon_names.tsv",
+        game_dir / "Data" / "custom_fused_pokemon_names.txt",
+    ]
+
+    found_path: Path | None = None
+    for p in candidates:
+        if p.is_file():
+            found_path = p
+            break
+
+    if found_path is None:
+        log.debug("No custom fused-name file found in Data/")
+        return custom_names
+
+    log.info("Loading custom fused names from %s", found_path)
+
+    try:
+        content = found_path.read_text(encoding="utf-8", errors="replace")
+    except OSError as exc:
+        log.warning("Cannot read %s: %s", found_path, exc)
+        return custom_names
+
+    for line_no, line in enumerate(content.splitlines(), start=1):
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        parts = line.split("\t")
+        if len(parts) < 3:
+            continue
+        try:
+            head_num = int(parts[0].strip())
+            body_num = int(parts[1].strip())
+        except ValueError:
+            continue
+        fused_name = parts[2].strip()
+        if not fused_name:
+            continue
+
+        head_species = species_id_map.get(head_num)
+        body_species = species_id_map.get(body_num)
+        if head_species and body_species:
+            custom_names[(head_species.upper(), body_species.upper())] = fused_name
+
+    log.info("Loaded %d custom fused names", len(custom_names))
+    return custom_names
+
+
+def _make_fusion_name(head_name: str, body_name: str) -> str:
+    """Generate a portmanteau fusion name the way KIF does at runtime.
+
+    The algorithm takes roughly the first half of the head Pokémon's name
+    (using ``ceil(len/2)``) and the last half of the body Pokémon's name
+    (using ``floor(len/2)``), then concatenates them.
+
+    Examples::
+
+        Bulbasaur + Charmander → "Bulbander"   (first 5 + last 5)
+        Bulbasaur + Rattata    → "Bulbatata"   (first 5 + last 4 → 3)
+        Pikachu   + Bulbasaur  → "Pikasaur"    (first 4 + last 5)
+    """
+    head = head_name.strip().title()
+    body = body_name.strip().title()
+    if not head or not body:
+        return (head or body) or ""
+
+    head_split = math.ceil(len(head) / 2)
+    body_split = len(body) // 2
+
+    head_part = head[:head_split]
+    body_part = body[body_split:]
+
+    return head_part + body_part.lower()
+
+
+def _resolve_pokename(
+    text: str,
+    head_name: str,
+    body_name: str,
+    custom_fused_names: dict | None = None,
+) -> str:
+    """Replace the literal ``POKENAME`` placeholder with the fusion's actual
+    fused name — the same portmanteau name KIF's game engine displays at
+    runtime.
+
+    Resolution order:
+
+    1. Look up the pair in *custom_fused_names* (loaded from
+       ``Data/custom_fused_pokemon_names.tsv``).
+    2. Generate a portmanteau name algorithmically via
+       :func:`_make_fusion_name`.
     """
     if not _POKENAME_RE.search(text):
         return text
-    display_name = f"{head_name.title()} {body_name.title()}"
+
+    pair_key = (head_name.upper(), body_name.upper())
+    if custom_fused_names and pair_key in custom_fused_names:
+        display_name = custom_fused_names[pair_key]
+        log.debug(
+            "POKENAME resolved via custom name: %s + %s → %s",
+            head_name, body_name, display_name,
+        )
+    else:
+        display_name = _make_fusion_name(head_name, body_name)
+        log.debug(
+            "POKENAME resolved via portmanteau: %s + %s → %s",
+            head_name, body_name, display_name,
+        )
+
     return _POKENAME_RE.sub(display_name, text)
 
 
@@ -1672,6 +1791,11 @@ def main(argv=None) -> int:
                 "stored in data files."
             )
 
+    # ---- load custom fused names for POKENAME resolution --------------------
+    custom_fused_names: dict = {}
+    if species_id_map:
+        custom_fused_names = parse_custom_fused_names(game_dir, species_id_map)
+
     # ---- build a lookup: filename → (text, dest) for retry mode ------------
     # Track which filenames had POKENAME in their *original* (pre-resolved)
     # source text, so --redo-pokename can filter to just those entries.
@@ -1685,9 +1809,10 @@ def main(argv=None) -> int:
         primary files but never overwrite them.
 
         For fusion entries, the literal ``POKENAME`` placeholder is resolved
-        to the title-cased head/body species names before inclusion, so that
-        TTS audio says the actual fusion name and the entry map stores
-        resolved text for accurate variant matching at runtime.
+        to the actual fused name (from custom fused-name data or a
+        portmanteau algorithm) before inclusion, so that TTS audio says the
+        correct fusion name and the entry map stores resolved text for
+        accurate variant matching at runtime.
         """
         _pokename_filenames.clear()
         items = []
@@ -1699,7 +1824,9 @@ def main(argv=None) -> int:
                 dest = output_dir / f"dex_{sp1}_{sp2}.ogg"
                 if _POKENAME_RE.search(entry_text):
                     _pokename_filenames.add(dest.name)
-                    entry_text = _resolve_pokename(entry_text, sp1, sp2)
+                    entry_text = _resolve_pokename(
+                        entry_text, sp1, sp2, custom_fused_names
+                    )
                 items.append((dest.name, entry_text, dest))
             # Variant entries for fusions with multiple dex descriptions
             for (sp1, sp2), variant_texts in sorted(fusion_variant_entries.items()):
@@ -1707,7 +1834,9 @@ def main(argv=None) -> int:
                     dest = output_dir / f"dex_{sp1}_{sp2}_v{idx}.ogg"
                     if _POKENAME_RE.search(vtext):
                         _pokename_filenames.add(dest.name)
-                        vtext = _resolve_pokename(vtext, sp1, sp2)
+                        vtext = _resolve_pokename(
+                            vtext, sp1, sp2, custom_fused_names
+                        )
                     items.append((dest.name, vtext, dest))
         return items
 
