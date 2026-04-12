@@ -380,10 +380,25 @@ module PokedexVoiceOver
     text.strip.downcase.gsub(/[^a-z0-9\s]/, "").gsub(/\s+/, " ").strip
   end
 
+  # Replace the literal POKENAME placeholder in entry text with the
+  # title-cased species names that KIF substitutes at runtime.
+  # Returns the original text unchanged if POKENAME is not present.
+  def self._resolve_pokename(text, head_species, body_species)
+    return text unless text && text =~ /POKENAME/i
+    head_name = species_str(head_species)
+    body_name = species_str(body_species)
+    return text unless head_name && body_name
+    display_name = "#{head_name.capitalize} #{body_name.capitalize}"
+    text.gsub(/POKENAME/i, display_name)
+  end
+
   # Given a list of variant bare names and the displayed entry text,
   # find the variant whose generated text matches the displayed text.
   # Returns the matching bare name, or nil if no match found.
-  def self._match_variant(variants, displayed_text)
+  #
+  # Optional head_species / body_species are used to resolve POKENAME
+  # placeholders in entry map text when normal matching fails.
+  def self._match_variant(variants, displayed_text, head_species = nil, body_species = nil)
     return nil unless displayed_text.is_a?(String) && !displayed_text.strip.empty?
     return nil if entry_map.empty?
 
@@ -391,98 +406,117 @@ module PokedexVoiceOver
     return nil if norm_displayed.empty?
     log("  _match_variant: trying to match (#{norm_displayed.length} chars): #{norm_displayed[0, 60]}...")
 
-    # Try exact normalized match
-    variants.each do |variant_bare|
-      stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-      map_text = entry_map[stem]
-      next unless map_text
-      if _normalize_text(map_text) == norm_displayed
-        log("  _match_variant: exact match => #{variant_bare}")
-        return variant_bare
-      end
-    end
-
-    # Try prefix match (first 40 normalized characters)
-    prefix_len = 40
-    if norm_displayed.length >= prefix_len
-      norm_prefix = norm_displayed[0, prefix_len]
+    # --- helper: run all matching strategies against a given text resolver ---
+    # resolver is a lambda(map_text) that returns the text to compare against.
+    _try_match = lambda do |resolver, tag|
+      # Try exact normalized match
       variants.each do |variant_bare|
         stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-        map_text = entry_map[stem]
+        map_text = resolver.call(entry_map[stem])
         next unless map_text
-        if _normalize_text(map_text).start_with?(norm_prefix)
-          log("  _match_variant: prefix match => #{variant_bare}")
+        if _normalize_text(map_text) == norm_displayed
+          log("  _match_variant: #{tag}exact match => #{variant_bare}")
           return variant_bare
         end
       end
-    end
 
-    # Try substring/contains match — the displayed text may be a substring
-    # of the entry map value, or vice versa (e.g. truncated fusion entries).
-    variants.each do |variant_bare|
-      stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-      map_text = entry_map[stem]
-      next unless map_text
-      norm_map = _normalize_text(map_text)
-      next if norm_map.empty?
-      if norm_map.include?(norm_displayed) || norm_displayed.include?(norm_map)
-        log("  _match_variant: substring match => #{variant_bare}")
-        return variant_bare
+      # Try prefix match (first 40 normalized characters)
+      prefix_len = 40
+      if norm_displayed.length >= prefix_len
+        norm_prefix = norm_displayed[0, prefix_len]
+        variants.each do |variant_bare|
+          stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+          map_text = resolver.call(entry_map[stem])
+          next unless map_text
+          if _normalize_text(map_text).start_with?(norm_prefix)
+            log("  _match_variant: #{tag}prefix match => #{variant_bare}")
+            return variant_bare
+          end
+        end
       end
-    end
 
-    # Word-overlap fallback — compare significant words (4+ chars) between
-    # the displayed text and each entry map value.  Pick the variant with
-    # the highest overlap ratio.  Threshold lowered to 0.35 and minimum
-    # word count to 2 so fusion entries (which combine/modify words from
-    # both base species) can still match.
-    displayed_words = norm_displayed.split(" ").select { |w| w.length >= 4 }.uniq
-    if displayed_words.length >= 2
-      best_variant = nil
-      best_ratio = 0.0
+      # Try substring/contains match
       variants.each do |variant_bare|
         stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-        map_text = entry_map[stem]
+        map_text = resolver.call(entry_map[stem])
         next unless map_text
         norm_map = _normalize_text(map_text)
-        map_words = norm_map.split(" ").select { |w| w.length >= 4 }.uniq
-        next if map_words.empty?
-        common = (displayed_words & map_words).length
-        ratio = common.to_f / [displayed_words.length, map_words.length].max
-        if ratio > best_ratio
-          best_ratio = ratio
-          best_variant = variant_bare
+        next if norm_map.empty?
+        if norm_map.include?(norm_displayed) || norm_displayed.include?(norm_map)
+          log("  _match_variant: #{tag}substring match => #{variant_bare}")
+          return variant_bare
         end
       end
-      if best_variant && best_ratio >= 0.35
-        log("  _match_variant: word-overlap match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
-        return best_variant
+
+      # Word-overlap fallback
+      displayed_words = norm_displayed.split(" ").select { |w| w.length >= 4 }.uniq
+      if displayed_words.length >= 2
+        best_variant = nil
+        best_ratio = 0.0
+        variants.each do |variant_bare|
+          stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+          map_text = resolver.call(entry_map[stem])
+          next unless map_text
+          norm_map = _normalize_text(map_text)
+          map_words = norm_map.split(" ").select { |w| w.length >= 4 }.uniq
+          next if map_words.empty?
+          common = (displayed_words & map_words).length
+          ratio = common.to_f / [displayed_words.length, map_words.length].max
+          if ratio > best_ratio
+            best_ratio = ratio
+            best_variant = variant_bare
+          end
+        end
+        if best_variant && best_ratio >= 0.35
+          log("  _match_variant: #{tag}word-overlap match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
+          return best_variant
+        end
       end
+
+      # Fuzzy LCS fallback
+      alpha_displayed = norm_displayed.gsub(/[^a-z0-9]/, "")
+      if alpha_displayed.length >= 20
+        best_variant = nil
+        best_ratio = 0.0
+        variants.each do |variant_bare|
+          stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+          map_text = resolver.call(entry_map[stem])
+          next unless map_text
+          alpha_map = _normalize_text(map_text).gsub(/[^a-z0-9]/, "")
+          next if alpha_map.empty?
+          ratio = _lcs_ratio(alpha_displayed, alpha_map)
+          if ratio > best_ratio
+            best_ratio = ratio
+            best_variant = variant_bare
+          end
+        end
+        if best_variant && best_ratio >= 0.85
+          log("  _match_variant: #{tag}fuzzy LCS match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
+          return best_variant
+        end
+      end
+
+      nil  # no match in this pass
     end
 
-    # Fuzzy fallback — compare alphanumeric-only character sequences using
-    # longest-common-subsequence (LCS) ratio.  This catches differences in
-    # punctuation placement, minor word reordering, or small edits that the
-    # earlier strategies miss.
-    alpha_displayed = norm_displayed.gsub(/[^a-z0-9]/, "")
-    if alpha_displayed.length >= 20
-      best_variant = nil
-      best_ratio = 0.0
-      variants.each do |variant_bare|
-        stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-        map_text = entry_map[stem]
-        next unless map_text
-        alpha_map = _normalize_text(map_text).gsub(/[^a-z0-9]/, "")
-        next if alpha_map.empty?
-        ratio = _lcs_ratio(alpha_displayed, alpha_map)
-        if ratio > best_ratio
-          best_ratio = ratio
-          best_variant = variant_bare
-        end
+    # --- Pass 1: try matching with raw entry map text -----------------------
+    identity = lambda { |t| t }
+    result = _try_match.call(identity, "")
+    return result if result
+
+    # --- Pass 2: if any entry map value contains POKENAME and we have
+    #     species context, retry all strategies after resolving it -----------
+    if head_species && body_species
+      has_pokename = variants.any? do |vb|
+        stem = vb.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+        mt = entry_map[stem]
+        mt && mt =~ /POKENAME/i
       end
-      if best_variant && best_ratio >= 0.85
-        log("  _match_variant: fuzzy LCS match (ratio=#{best_ratio.round(2)}) => #{best_variant}")
-        return best_variant
+      if has_pokename
+        log("  _match_variant: retrying with POKENAME resolved (head=#{head_species}, body=#{body_species})")
+        resolver = lambda { |t| t ? _resolve_pokename(t, head_species, body_species) : nil }
+        result = _try_match.call(resolver, "POKENAME-resolved ")
+        return result if result
       end
     end
 
@@ -608,7 +642,7 @@ module PokedexVoiceOver
         end
 
         if fusion_variants.any?
-          matched = _match_variant(fusion_variants, displayed_text)
+          matched = _match_variant(fusion_variants, displayed_text, species, fused_species)
           if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
             log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
           end

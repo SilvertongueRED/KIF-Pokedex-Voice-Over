@@ -59,6 +59,9 @@ Usage
   # Retry only entries that failed in a previous run
   python generate_voices.py --game-dir /path/to/KIF --retry-failed
 
+  # Re-generate only entries that had the POKENAME placeholder (resolve to real names)
+  python generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename
+
   # Generate for a single species only
   python generate_voices.py --game-dir /path/to/KIF --species BULBASAUR
 
@@ -194,6 +197,23 @@ def _clean_entry_text(raw: str) -> str:
     text = re.sub(r"[ \t]{3,}", "  ", text)
     text = text.strip()
     return text
+
+
+_POKENAME_RE = re.compile(r"POKENAME", re.IGNORECASE)
+
+
+def _resolve_pokename(text: str, head_name: str, body_name: str) -> str:
+    """Replace the literal ``POKENAME`` placeholder with title-cased species names.
+
+    KIF's game engine performs this substitution at runtime, but the raw
+    dex-entry text files contain the literal placeholder.  We resolve it
+    before TTS so the audio says the actual fusion name (e.g.
+    ``"Hoothoot Rattata"``) instead of the word "POKENAME".
+    """
+    if not _POKENAME_RE.search(text):
+        return text
+    display_name = f"{head_name.title()} {body_name.title()}"
+    return _POKENAME_RE.sub(display_name, text)
 
 
 def parse_pbs_pokemon(pbs_file: Path) -> dict:
@@ -1342,6 +1362,16 @@ def build_arg_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--redo-pokename",
+        action="store_true",
+        help=(
+            "Re-generate ONLY audio entries whose source dex text contains "
+            "the literal POKENAME placeholder.  The placeholder is resolved "
+            "to the fusion's actual species names before TTS.  Existing files "
+            "are overwritten for matching entries without requiring --overwrite."
+        ),
+    )
+    p.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite existing audio files (default: skip).",
@@ -1643,13 +1673,23 @@ def main(argv=None) -> int:
             )
 
     # ---- build a lookup: filename → (text, dest) for retry mode ------------
+    # Track which filenames had POKENAME in their *original* (pre-resolved)
+    # source text, so --redo-pokename can filter to just those entries.
+    _pokename_filenames: set[str] = set()
+
     def _all_pending_entries() -> list[tuple[str, str, Path]]:
         """Return list of (filename, text, dest) for all entries to process.
 
         Includes primary fusion entries and any variant entries (named with
         a ``_v2``, ``_v3``, … suffix).  Variant files are generated alongside
         primary files but never overwrite them.
+
+        For fusion entries, the literal ``POKENAME`` placeholder is resolved
+        to the title-cased head/body species names before inclusion, so that
+        TTS audio says the actual fusion name and the entry map stores
+        resolved text for accurate variant matching at runtime.
         """
+        _pokename_filenames.clear()
         items = []
         for species_name, entry_text in sorted(all_entries.items()):
             dest = output_dir / f"dex_{species_name}.ogg"
@@ -1657,11 +1697,17 @@ def main(argv=None) -> int:
         if args.fusions:
             for (sp1, sp2), entry_text in sorted(fusion_entries.items()):
                 dest = output_dir / f"dex_{sp1}_{sp2}.ogg"
+                if _POKENAME_RE.search(entry_text):
+                    _pokename_filenames.add(dest.name)
+                    entry_text = _resolve_pokename(entry_text, sp1, sp2)
                 items.append((dest.name, entry_text, dest))
             # Variant entries for fusions with multiple dex descriptions
             for (sp1, sp2), variant_texts in sorted(fusion_variant_entries.items()):
                 for idx, vtext in enumerate(variant_texts, start=2):
                     dest = output_dir / f"dex_{sp1}_{sp2}_v{idx}.ogg"
+                    if _POKENAME_RE.search(vtext):
+                        _pokename_filenames.add(dest.name)
+                        vtext = _resolve_pokename(vtext, sp1, sp2)
                     items.append((dest.name, vtext, dest))
         return items
 
@@ -1691,6 +1737,25 @@ def main(argv=None) -> int:
                     "Failed entry '%s' not found in current Pokédex data — skipping.",
                     fname,
                 )
+    elif args.redo_pokename:
+        # Filter to only entries whose *original* source text contained POKENAME.
+        # _all_pending_entries() already resolved the placeholder in the text;
+        # we just need to select the entries that were flagged.
+        all_items = _all_pending_entries()
+        pending = [
+            (fname, text, dest)
+            for fname, text, dest in all_items
+            if fname in _pokename_filenames
+        ]
+        log.info(
+            "Redo-POKENAME mode: %d entries with POKENAME placeholder to regenerate.",
+            len(pending),
+        )
+        if not pending:
+            log.info("No entries with POKENAME found — nothing to redo.")
+            print("\nDone — generated: 0, skipped: 0, failed: 0")
+            print(f"Audio files saved to: {output_dir}")
+            return 0
     else:
         pending = _all_pending_entries()
 
@@ -1713,7 +1778,7 @@ def main(argv=None) -> int:
         # A regular filename has one:            dex_SPECIES.ogg  (count == 1)
         is_fusion = filename.count("_") >= 2
 
-        if not args.overwrite and dest.exists() and not args.retry_failed:
+        if not args.overwrite and dest.exists() and not args.retry_failed and not args.redo_pokename:
             log.debug("Skipping %s (already exists)", filename)
             skipped += 1
             continue
