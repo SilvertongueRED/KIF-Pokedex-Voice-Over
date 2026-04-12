@@ -1931,7 +1931,7 @@ class PokedexVoiceOverSettingsScene < PokemonOption_Scene
     options << EnumOption.new(
       _INTL("Mute Music During Voice"),
       [_INTL("Off"), _INTL("On")],
-      proc { ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover) || 0 },
+      proc { ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover) || 1 },
       proc { |value| ModSettingsMenu.set(:pokedex_vo_mute_during_voiceover, value) },
       _INTL("Mute music while the Pokédex entry is being read (e.g. after capture)")
     )
