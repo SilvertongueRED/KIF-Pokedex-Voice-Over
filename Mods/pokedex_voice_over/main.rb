@@ -158,6 +158,14 @@ module PokedexVoiceOver
     settings.fetch("mute_music", true)
   end
 
+  def self.mute_during_voiceover?
+    if defined?(ModSettingsMenu)
+      val = ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover)
+      return val == 1 if !val.nil?
+    end
+    settings.fetch("mute_during_voiceover", true)
+  end
+
   # -------------------------------------------------------------------------
   # Duration manifest (loaded lazily, cached)
   # -------------------------------------------------------------------------
@@ -239,6 +247,46 @@ module PokedexVoiceOver
       @saved_bgm = nil
     rescue => e
       log("  BGM restore failed: #{e.message}")
+    end
+  end
+
+  # Save the currently playing BGM and fade it out for the duration of
+  # voice-over playback.  Uses separate state variables so it does not
+  # conflict with the scene-level mute managed by save_and_mute_bgm.
+  # Does nothing when the mute_during_voiceover setting is disabled or
+  # when the scene-level BGM mute is already active.
+  def self.save_and_mute_bgm_for_voiceover
+    return unless mute_during_voiceover?
+    return if @vo_bgm_muted   # already muted for voiceover
+    return if @bgm_muted      # scene-level mute is active — don't overwrite
+    begin
+      @vo_saved_bgm = $game_system.playing_bgm.clone rescue nil
+      Audio.bgm_fade(300) rescue nil
+      @vo_bgm_muted = true
+      log("  BGM muted for voiceover (saved: #{@vo_saved_bgm.inspect})")
+    rescue => e
+      log("  BGM mute for voiceover failed: #{e.message}")
+      @vo_bgm_muted = false
+    end
+  end
+
+  # Restore the BGM that was muted for voice-over playback.  Safe to call
+  # multiple times — does nothing if no BGM was muted for voiceover.
+  def self.restore_bgm_after_voiceover
+    return unless @vo_bgm_muted
+    begin
+      if @vo_saved_bgm
+        begin
+          $game_system.bgm_play(@vo_saved_bgm)
+        rescue
+          Audio.bgm_play(@vo_saved_bgm.name, @vo_saved_bgm.volume, @vo_saved_bgm.pitch) rescue nil
+        end
+        log("  BGM restored after voiceover: #{@vo_saved_bgm.inspect}")
+      end
+      @vo_bgm_muted = false
+      @vo_saved_bgm = nil
+    rescue => e
+      log("  BGM restore after voiceover failed: #{e.message}")
     end
   end
 
@@ -690,6 +738,33 @@ module PokedexVoiceOver
     return if playback_mode == :none
 
     # ------------------------------------------------------------------
+    # Compute voiceover duration on the MAIN THREAD (needs file I/O for
+    # durations manifest) so the background thread can sleep for the right
+    # amount of time before restoring BGM.
+    # ------------------------------------------------------------------
+    vo_duration = nil
+    if mute_during_voiceover?
+      begin
+        case playback_mode
+        when :single
+          # Strip subdir prefix to get the bare filename used in durations manifest
+          stem = chosen_file.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+          vo_duration = (durations["#{stem}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+          log("  Voiceover duration for #{stem}: #{vo_duration}s")
+        when :sequential
+          head_dur = seq_head_dur || SEQUENTIAL_DURATION_FALLBACK
+          body_stem = seq_body.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+          body_dur = (durations["#{body_stem}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+          vo_duration = head_dur + body_dur
+          log("  Voiceover total sequential duration: #{vo_duration}s (head=#{head_dur}s, body=#{body_dur}s)")
+        end
+      rescue StandardError => e
+        log("  Voiceover duration lookup error: #{e.message}")
+        vo_duration = SEQUENTIAL_DURATION_FALLBACK
+      end
+    end
+
+    # ------------------------------------------------------------------
     # Background thread: only handles the CRY_DELAY sleep and the actual
     # Audio.se_play / _play_bare calls — no file I/O or `require` here.
     # ------------------------------------------------------------------
@@ -699,6 +774,9 @@ module PokedexVoiceOver
           # Wait for the Pokémon's cry to finish before reading the entry.
           _interruptible_sleep(CRY_DELAY, my_gen)
           next if @playback_gen != my_gen
+
+          # Mute BGM for the duration of the voice-over playback
+          save_and_mute_bgm_for_voiceover
 
           case playback_mode
           when :single
@@ -711,8 +789,18 @@ module PokedexVoiceOver
               Audio.se_play(seq_body, play_vol, 100)
             end
           end
+
+          # Wait for the voice-over to finish, then restore BGM
+          if @vo_bgm_muted && vo_duration
+            _interruptible_sleep(vo_duration, my_gen)
+            restore_bgm_after_voiceover
+          end
         rescue StandardError => e
           PokedexVoiceOver.log("  Playback thread error: #{e.class}: #{e.message}")
+        ensure
+          # Safety net: always restore BGM if it was muted for voiceover
+          # and the thread is exiting (e.g. due to generation change or error)
+          restore_bgm_after_voiceover if @vo_bgm_muted
         end
       end
     rescue StandardError => e
@@ -734,8 +822,9 @@ module PokedexVoiceOver
 
   # Stop any playing voice-over, including any pending sequential playback.
   # Bumping @playback_gen causes any running playback thread to exit cleanly.
-  # NOTE: BGM is now managed by the scene hooks (muted on open, restored on
-  # close), so stop only handles SE playback.
+  # NOTE: Scene-level BGM is managed by the scene hooks (muted on open,
+  # restored on close).  Voiceover-level BGM is restored here in case stop()
+  # is called before the playback thread finishes its restore.
   def self.stop
     @playback_gen = (@playback_gen || 0) + 1
     begin
@@ -743,6 +832,7 @@ module PokedexVoiceOver
     rescue StandardError => e
       log("stop error: #{e.class}: #{e.message}")
     end
+    restore_bgm_after_voiceover
   end
 end
 
@@ -1839,6 +1929,14 @@ class PokedexVoiceOverSettingsScene < PokemonOption_Scene
     )
 
     options << EnumOption.new(
+      _INTL("Mute Music During Voice"),
+      [_INTL("Off"), _INTL("On")],
+      proc { ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover) || 1 },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_mute_during_voiceover, value) },
+      _INTL("Mute music while the Pokédex entry is being read (e.g. after capture)")
+    )
+
+    options << EnumOption.new(
       _INTL("Re-read on Page Return"),
       [_INTL("Off"), _INTL("On")],
       proc { ModSettingsMenu.get(:pokedex_vo_replay_on_page_change) || 0 },
@@ -1901,6 +1999,7 @@ pokedex_vo_register_settings = proc {
   ModSettingsMenu.set(:pokedex_vo_enabled, 1) if ModSettingsMenu.get(:pokedex_vo_enabled).nil?
   ModSettingsMenu.set(:pokedex_vo_volume, 80) if ModSettingsMenu.get(:pokedex_vo_volume).nil?
   ModSettingsMenu.set(:pokedex_vo_mute_music, 1) if ModSettingsMenu.get(:pokedex_vo_mute_music).nil?
+  ModSettingsMenu.set(:pokedex_vo_mute_during_voiceover, 1) if ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover).nil?
   ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, 0) if ModSettingsMenu.get(:pokedex_vo_replay_on_page_change).nil?
 
   ModSettingsMenu.register(:pokedex_vo_submenu, {
@@ -1917,7 +2016,8 @@ pokedex_vo_register_settings = proc {
     category: "Interface",
     searchable: [
       "voice over", "pokedex", "volume", "mute music", "narration",
-      "dexter", "voice", "audio", "re-read", "page change"
+      "dexter", "voice", "audio", "re-read", "page change",
+      "capture", "mute during voiceover"
     ]
   })
 }
