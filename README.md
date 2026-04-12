@@ -258,10 +258,18 @@ Some fusion dex entries contain the literal `POKENAME` placeholder (e.g.
 engine replaces this at runtime with the actual fusion name, but the raw
 text files retain the placeholder.
 
-The generator resolves `POKENAME` to the fusion's title-cased species names
-(e.g. *"Hoothoot Rattata"*) before sending text to TTS, so the audio says
-the actual name.  The resolved text is also stored in `dex_entry_map.json`
-for accurate variant matching at runtime.
+The generator resolves `POKENAME` to the fusion's actual fused name using:
+
+1. **Custom fused names** — loaded from `Data/custom_fused_pokemon_names.tsv`
+   (or `.txt`) in the game directory, where KIF stores player/community-defined
+   fusion names (e.g. *"Bulbasaurizard"* for Bulbasaur + Charmander).
+2. **Portmanteau algorithm** — if no custom name exists, the script generates
+   one algorithmically by taking roughly the first half of the head Pokémon's
+   name and the last half of the body Pokémon's name (e.g. *"Bulbander"* for
+   Bulbasaur + Charmander, *"Pikasaur"* for Pikachu + Bulbasaur).
+
+The resolved text is stored in `dex_entry_map.json` for accurate variant
+matching at runtime.
 
 If you've already generated audio and want to fix only the POKENAME entries:
 
@@ -315,7 +323,7 @@ TTS audio is saved without effects.
 | `requests` not installed | Run `pip install -r tools/requirements.txt` to install all dependencies including `requests` (needed for `--backend fakeyou`). |
 | No voice plays | Check `Mods/pokedex_voice_over/debug.log` for diagnostics.  Verify `.ogg` files are in `Audio/SE/Pokedex/` (inside your KIF game root).  The log shows whether hooks were installed, what species was detected, and whether the audio file was found. |
 | Wrong audio variant plays for fusions | Ensure `dex_entry_map.json` exists in `Audio/SE/Pokedex/`.  If it's missing, re-run `tools/generate_voices.py` to regenerate it.  The mod logs a warning when multiple variants exist but the entry map is missing. |
-| Fusion audio says "POKENAME" literally | Re-run the generator with `--redo-pokename` to resolve the placeholder to actual species names: `python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename` |
+| Fusion audio says "POKENAME" literally | Re-run the generator with `--redo-pokename` to resolve the placeholder to the actual fused name: `python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename` |
 | Some entries failed to generate | Re-run with `--retry-failed` to retry only the failed entries — check `Audio/SE/Pokedex/failed_entries.json` for details |
 | `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically.  If your game stores species in a `Registration.rb` script, use `--registration-file /path/to/001_Registration.rb`. |
 | `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
