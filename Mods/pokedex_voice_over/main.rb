@@ -726,12 +726,15 @@ module PokedexVoiceOver
   # Play the voice-over for *species* (and optionally its fusion partner).
   #
   # For fused Pokémon:
-  #   1. If a dedicated fusion audio file exists, play it directly.
-  #      If variant files exist (_v2, _v3…), the one matching the
-  #      *displayed_text* is chosen when possible; falls back to random.
-  #   2. Otherwise, if both base-species files exist, play them sequentially
-  #      in a background thread (head first, then body after the head
-  #      finishes — timed using the dex_durations.json manifest).
+  #   1. If a dedicated fusion audio file exists AND its text matches
+  #      *displayed_text*, play that file (chosen via _match_variant).
+  #   2. If fusion files exist but none match (e.g. the game showed a
+  #      mashed base-species entry), fall back to sequential base-species
+  #      playback (head then body) when both base files exist.
+  #   3. If no fusion files exist at all, try sequential base-species
+  #      playback directly.
+  #   4. Last resort (fusion files exist but no base files): play a random
+  #      fusion variant.
   #
   # Returns silently if no matching audio can be found.
   def self.play(species, fused_species = nil, displayed_text = nil)
@@ -784,19 +787,39 @@ module PokedexVoiceOver
           end
         end
 
+        # Base-species paths used by sequential fallback (shared across branches).
+        bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
+        bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
+
         if fusion_variants.any?
           matched = _match_variant(fusion_variants, displayed_text, species, fused_species)
           if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
-            log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+            log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map.")
           end
-          chosen_file = matched || fusion_variants.sample
-          playback_mode = :single
-          log("  Playing fusion audio: #{chosen_file} (from #{fusion_variants.length} variant(s), matched=#{!matched.nil?})")
+          if matched
+            chosen_file = matched
+            playback_mode = :single
+            log("  Playing fusion audio: #{chosen_file} (from #{fusion_variants.length} variant(s), matched=true)")
+          else
+            # No variant matched — the displayed text is likely a mashed base-species
+            # entry (the game randomly combined sentences from both base Pokémon).
+            # Playing a random custom fusion audio file would be out of sync with
+            # what's on screen, so prefer sequential base-species playback instead.
+            if _audio_exists?(bare_head) && _audio_exists?(bare_body)
+              seq_head = bare_head
+              seq_body = bare_body
+              seq_head_dur = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+              playback_mode = :sequential
+              log("  No variant match — displayed text appears to be a mashed base-species entry. Falling back to sequential base-species playback: #{seq_head} then #{seq_body}")
+            else
+              # Base species files not available — fall back to random fusion variant
+              chosen_file = fusion_variants.sample
+              playback_mode = :single
+              log("  No variant match and no base species audio — playing random fusion variant: #{chosen_file} (from #{fusion_variants.length} variant(s))")
+            end
+          end
         else
           # No custom fusion entry — fall back to sequential base-species playback
-          bare_head = "#{AUDIO_SUBDIR}/dex_#{base}"
-          bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
-
           if _audio_exists?(bare_head) && _audio_exists?(bare_body)
             seq_head = bare_head
             seq_body = bare_body
