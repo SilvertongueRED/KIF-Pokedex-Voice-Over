@@ -106,6 +106,10 @@ module PokedexVoiceOver
   # cry to finish before the Pokédex entry is read aloud.
   CRY_DELAY = 0.3
 
+  # Subfolder inside Audio/SE/Pokedex/ where Piper-generated TTS cache files
+  # are stored.  Each unique entry text gets its own deterministic filename.
+  TTS_CACHE_SUBDIR = "#{AUDIO_SUBDIR}/tts_cache"
+
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
 
@@ -164,6 +168,166 @@ module PokedexVoiceOver
       return val == 1 if !val.nil?
     end
     settings.fetch("mute_during_voiceover", true)
+  end
+
+  # Returns true if Piper TTS fallback is enabled (default: on).
+  def self.tts_enabled?
+    if defined?(ModSettingsMenu)
+      val = ModSettingsMenu.get(:pokedex_vo_tts_enabled)
+      return val == 1 if !val.nil?
+    end
+    settings.fetch("tts_enabled", true)
+  end
+
+  # -------------------------------------------------------------------------
+  # Piper TTS auto-detection helpers (cached after first call)
+  # -------------------------------------------------------------------------
+
+  # Path to the Piper TTS executable.  Checks for a mod-bundled copy first,
+  # then falls back to the system PATH name (plain "piper" / "piper.exe").
+  def self.tts_piper_path
+    return @tts_piper_path if defined?(@tts_piper_path)
+    candidates = [
+      "Mods/pokedex_voice_over/piper/piper.exe",
+      "Mods/pokedex_voice_over/piper/piper",
+    ]
+    local = candidates.find { |p| FileTest.exist?(p) }
+    @tts_piper_path = local || (RUBY_PLATFORM.to_s =~ /mswin|mingw|windows/i ? "piper.exe" : "piper")
+  end
+
+  # Path to the Piper voice model (.onnx file).  Returns nil when not found.
+  def self.tts_model_path
+    return @tts_model_path if defined?(@tts_model_path)
+    candidates = [
+      "Mods/pokedex_voice_over/piper/model.onnx",
+      "Mods/pokedex_voice_over/piper/voice.onnx",
+    ]
+    @tts_model_path = candidates.find { |p| FileTest.exist?(p) }
+  end
+
+  # Absolute directory used for TTS cache files (e.g. Audio/SE/Pokedex/tts_cache/).
+  def self.tts_cache_dir
+    "Audio/SE/#{TTS_CACHE_SUBDIR}"
+  end
+
+  # Returns true when both the Piper executable and a voice model exist on disk.
+  # The result is cached after the first call.
+  def self.piper_available?
+    return @piper_available unless @piper_available.nil?
+    exe   = tts_piper_path
+    model = tts_model_path
+    # If the exe path is just the bare name ("piper"/"piper.exe") we can't
+    # reliably check FileTest without knowing the full PATH; assume it might
+    # be on PATH and let the system() call tell us at runtime.
+    exe_ok   = (exe =~ /[\/\\]/) ? FileTest.exist?(exe) : true
+    model_ok = model && FileTest.exist?(model)
+    @piper_available = !!(exe_ok && model_ok)
+    log("  piper_available? => #{@piper_available} (exe=#{exe.inspect}, model=#{model.inspect})")
+    @piper_available
+  end
+
+  # -------------------------------------------------------------------------
+  # Piper TTS generation helpers
+  # -------------------------------------------------------------------------
+
+  # Generate a deterministic cache filename from text content using a simple
+  # FNV-1a 32-bit hash — no external libraries required.
+  # Returns a bare audio path (relative to Audio/SE/) without extension,
+  # e.g. "Pokedex/tts_cache/dex_tts_a1b2c3d4".
+  def self._tts_cache_path(text)
+    hash = 2166136261  # FNV-1a 32-bit offset basis
+    text.each_byte do |b|
+      hash ^= b
+      hash = (hash * 16777619) & 0xFFFFFFFF
+    end
+    hex = hash.to_s(16).rjust(8, "0")
+    "#{TTS_CACHE_SUBDIR}/dex_tts_#{hex}"
+  end
+
+  # Generate a WAV file via Piper TTS for *text* and return the bare audio
+  # path on success (relative to Audio/SE/, without extension), or nil on
+  # failure.  The generated file is cached by content hash so subsequent
+  # calls for the same text are instant.
+  def self._generate_tts(text)
+    return nil unless piper_available?
+    return nil if text.nil? || text.strip.empty?
+
+    cache_bare = _tts_cache_path(text)
+    cache_wav  = "Audio/SE/#{cache_bare}.wav"
+
+    # Ensure the cache subdirectory exists
+    begin
+      Dir.mkdir(tts_cache_dir) unless FileTest.exist?(tts_cache_dir)
+    rescue => e
+      log("  _generate_tts: could not create cache dir: #{e.message}")
+      return nil
+    end
+
+    # Cache hit — already generated
+    if FileTest.exist?(cache_wav)
+      log("  _generate_tts: cache hit => #{cache_bare}")
+      return cache_bare
+    end
+
+    exe   = tts_piper_path
+    model = tts_model_path
+
+    # Write text to a temporary input file to avoid shell injection issues.
+    tmp_input = "#{tts_cache_dir}/_tts_input.txt"
+    begin
+      File.open(tmp_input, "w") { |f| f.write(text) }
+    rescue => e
+      log("  _generate_tts: failed to write temp input: #{e.message}")
+      return nil
+    end
+
+    # Build the Piper invocation command.
+    # Piper reads from stdin and writes to --output_file.
+    # Stdin redirection via < works on both cmd.exe (Windows) and bash.
+    cmd = "\"#{exe}\" --model \"#{model}\" --output_file \"#{cache_wav}\" < \"#{tmp_input}\""
+    log("  _generate_tts: running piper (#{text.length} chars)...")
+
+    begin
+      success = system(cmd)
+      if success && FileTest.exist?(cache_wav)
+        log("  _generate_tts: success => #{cache_bare}")
+        return cache_bare
+      else
+        log("  _generate_tts: failed (exit_status=#{success.inspect}, file_exists=#{FileTest.exist?(cache_wav)})")
+        return nil
+      end
+    rescue => e
+      log("  _generate_tts: error: #{e.class}: #{e.message}")
+      return nil
+    ensure
+      File.delete(tmp_input) rescue nil
+    end
+  end
+
+  # Read the duration of a WAV file (in seconds) by parsing its 44-byte
+  # canonical header — no external libraries required.
+  # Falls back to SEQUENTIAL_DURATION_FALLBACK when the header is unreadable.
+  #
+  # WAV header layout (little-endian):
+  #   Offset  0: "RIFF" marker (4 bytes)
+  #   Offset 28: byte rate — bytes per second (4 bytes, uint32 LE)
+  #   Offset 40: data chunk size in bytes (4 bytes, uint32 LE)
+  # Duration = data_size / byte_rate
+  def self._tts_audio_duration(wav_path)
+    begin
+      File.open(wav_path, "rb") do |f|
+        header = f.read(44)
+        return SEQUENTIAL_DURATION_FALLBACK unless header && header.length >= 44
+        return SEQUENTIAL_DURATION_FALLBACK unless header[0, 4] == "RIFF"
+        byte_rate = header[28, 4].unpack("V")[0]
+        data_size = header[40, 4].unpack("V")[0]
+        return SEQUENTIAL_DURATION_FALLBACK if byte_rate.nil? || byte_rate <= 0
+        data_size.to_f / byte_rate
+      end
+    rescue => e
+      log("  _tts_audio_duration error: #{e.message}")
+      SEQUENTIAL_DURATION_FALLBACK
+    end
   end
 
   # -------------------------------------------------------------------------
@@ -1017,6 +1181,27 @@ module PokedexVoiceOver
           end
         end
 
+        # Step 2.5: Piper TTS fallback — generate audio on-the-fly from the
+        # displayed text.  Sits between the pre-recorded fusion audio check
+        # (step 2) and the sequential base-species fallback (step 3) so the
+        # player hears something that actually matches what is on screen.
+        # Only runs when piper is installed and the TTS setting is enabled.
+        if playback_mode == :none && piper_available? && tts_enabled?
+          if displayed_text && !displayed_text.strip.empty?
+            log("  Step 2.5: attempting Piper TTS for displayed text (#{displayed_text.length} chars)")
+            tts_bare = _generate_tts(displayed_text)
+            if tts_bare
+              chosen_file   = tts_bare
+              playback_mode = :single
+              log("  Playing Piper TTS audio: #{chosen_file}")
+            else
+              log("  Piper TTS generation failed — falling through to sequential base-species playback")
+            end
+          else
+            log("  Step 2.5: skipping Piper TTS — no displayed text available")
+          end
+        end
+
         # Step 3: sequential base-species fallback — reached when:
         #   a) auto-generated entry detected, OR
         #   b) no fusion audio files exist, OR
@@ -1085,7 +1270,16 @@ module PokedexVoiceOver
         when :single
           # Strip subdir prefix to get the bare filename used in durations manifest
           stem = chosen_file.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
-          vo_duration = (durations["#{stem}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+          manifest_dur = durations["#{stem}.ogg"] || durations["#{stem}.wav"]
+          if manifest_dur
+            vo_duration = manifest_dur.to_f
+          elsif chosen_file.include?("tts_cache")
+            # Piper-generated WAV — read actual duration from the WAV header
+            wav_abs = "Audio/SE/#{chosen_file}.wav"
+            vo_duration = FileTest.exist?(wav_abs) ? _tts_audio_duration(wav_abs) : SEQUENTIAL_DURATION_FALLBACK
+          else
+            vo_duration = SEQUENTIAL_DURATION_FALLBACK.to_f
+          end
           log("  Voiceover duration for #{stem}: #{vo_duration}s")
         when :sequential
           head_dur = seq_head_dur || SEQUENTIAL_DURATION_FALLBACK
@@ -1181,6 +1375,33 @@ end
 #
 # The description/entry page is typically page index 0 in Pokémon Infinite
 # Fusion.  Adjust ENTRY_PAGE below if your build uses a different index.
+#
+# KNOWN BUG FIXES (v1.16.0)
+# --------------------------
+# - Added Piper TTS fallback (Step 2.5) in the fusion playback chain.
+#   When no pre-recorded fusion audio matches the displayed text, the mod now
+#   calls the local Piper TTS engine (if installed) to generate audio on-the-fly
+#   from whatever text is currently on screen — including KIF's randomly
+#   spliced auto-generated entries.  Generated files are cached by content hash
+#   so repeat visits to the same entry play instantly.
+# - Added piper_available? / tts_enabled? / tts_piper_path / tts_model_path
+#   module helpers.  Piper is auto-detected from
+#   Mods/pokedex_voice_over/piper/piper(.exe) and model.onnx; falls back to
+#   the system PATH when no local copy is present.
+# - Added _tts_cache_path(text) — FNV-1a 32-bit hash generates deterministic
+#   cache filenames without requiring external gem dependencies.
+# - Added _generate_tts(text) — calls Piper via system() with a temp input
+#   file to avoid shell injection.  Returns the cache path on success, nil
+#   when Piper is not installed or generation fails.
+# - Added _tts_audio_duration(wav_path) — reads the 44-byte canonical WAV
+#   header to determine playback duration for BGM mute timing, replacing the
+#   SEQUENTIAL_DURATION_FALLBACK used for unknown files.
+# - Added "TTS Fallback (Piper)" toggle to the Mod Settings submenu (default On).
+# - Updated duration computation for :single mode: TTS-generated WAV files now
+#   use _tts_audio_duration instead of the 5s fallback constant.
+# - Added tools/train_piper_voice.py — prepares an LJSpeech-format training
+#   dataset from existing dex_*.ogg files and dex_entry_map.json so users can
+#   train a custom Dexter-voice Piper model on Google Colab.
 #
 # KNOWN BUG FIXES (v1.15.0)
 # --------------------------
@@ -2309,6 +2530,14 @@ class PokedexVoiceOverSettingsScene < PokemonOption_Scene
       _INTL("Replay the voice-over when navigating back to the description page")
     )
 
+    options << EnumOption.new(
+      _INTL("TTS Fallback (Piper)"),
+      [_INTL("Off"), _INTL("On")],
+      proc { v = ModSettingsMenu.get(:pokedex_vo_tts_enabled); v.nil? ? 1 : v },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_tts_enabled, value) },
+      _INTL("Use Piper TTS to read auto-generated entries aloud when no pre-recorded audio exists (requires Piper to be installed)")
+    )
+
     options = auto_insert_spacers(options) if defined?(ModSettingsSpacing) && respond_to?(:auto_insert_spacers)
     return options
   end
@@ -2366,6 +2595,7 @@ pokedex_vo_register_settings = proc {
   ModSettingsMenu.set(:pokedex_vo_mute_music, 1) if ModSettingsMenu.get(:pokedex_vo_mute_music).nil?
   ModSettingsMenu.set(:pokedex_vo_mute_during_voiceover, 1) if ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover).nil?
   ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, 0) if ModSettingsMenu.get(:pokedex_vo_replay_on_page_change).nil?
+  ModSettingsMenu.set(:pokedex_vo_tts_enabled, 1) if ModSettingsMenu.get(:pokedex_vo_tts_enabled).nil?
 
   ModSettingsMenu.register(:pokedex_vo_submenu, {
     name: "Pokédex Voice Over",
@@ -2382,7 +2612,8 @@ pokedex_vo_register_settings = proc {
     searchable: [
       "voice over", "pokedex", "volume", "mute music", "narration",
       "dexter", "voice", "audio", "re-read", "page change",
-      "capture", "mute during voiceover"
+      "capture", "mute during voiceover", "tts", "piper", "text to speech",
+      "tts fallback", "auto-generated"
     ]
   })
 }
