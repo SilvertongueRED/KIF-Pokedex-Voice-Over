@@ -42,6 +42,8 @@ Next steps (printed at the end of the script)
     5.  Copy model.onnx + model.onnx.json to Mods/pokedex_voice_over/piper/
 """
 
+from __future__ import annotations
+
 import argparse
 import csv
 import json
