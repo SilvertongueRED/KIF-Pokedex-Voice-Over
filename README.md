@@ -31,6 +31,10 @@ including every fused variant.
   on page return) via Stonewall's **Mod Settings** under Interface
 - 🔇 Silently skips entries that have no audio file — safe to install before
   generating audio
+- 🗣️ **Piper TTS fallback** — when no pre-recorded audio matches an
+  auto-generated fusion entry, the mod can generate speech on-the-fly using
+  [Piper](https://github.com/rhasspy/piper), a lightweight offline neural TTS
+  engine; generated audio is cached so repeat visits play instantly
 - 🛑 Automatically stops the voice when you close the Pokédex
 - 🪝 **Text capture hooks** — hooks KIF's `drawEntryText`,
   `getCustomEntryText`, `getCustomDexEntry`, and `getAIDexEntry` methods to
@@ -199,6 +203,7 @@ Settings**.
 | **Voice Volume** | 80 | Playback volume (0–100) |
 | **Mute Music in Pokédex** | On | Fade out background music while the Pokédex is open |
 | **Re-read on Page Return** | Off | Re-play the voice when navigating back to the description page |
+| **TTS Fallback (Piper)** | On | Use Piper TTS to read auto-generated entries aloud when no pre-recorded audio exists (requires Piper to be installed — see [Piper TTS Fallback](#piper-tts-fallback-auto-generated-entries)) |
 
 ---
 
@@ -312,6 +317,195 @@ TTS audio is saved without effects.
 
 ---
 
+## Piper TTS Fallback (Auto-Generated Entries)
+
+When a fused Pokémon has no pre-recorded audio, KIF auto-generates the
+Pokédex entry by randomly splicing sentences from both base species' entries.
+This text changes every time you open the entry, so no single pre-recorded
+file can ever match it.
+
+The mod solves this with a **Piper TTS fallback**: a lightweight, offline
+neural text-to-speech engine that reads whatever text is currently on screen.
+It sits between "try pre-recorded fusion audio" and "play both base species
+back-to-back" in the playback chain:
+
+```
+1. Try matched fusion audio (dex_HEAD_BODY.ogg)  →  if found & text matches, play it
+2. Try Piper TTS (NEW)                           →  if installed, generate & play on-the-fly
+3. Fall back to sequential base-species playback (existing behaviour)
+```
+
+### Setting Up Piper TTS
+
+#### Step A — Download Piper
+
+Download the release for your platform from the
+[Piper releases page](https://github.com/rhasspy/piper/releases):
+
+| Platform | File to download |
+|---|---|
+| Windows | `piper_windows_amd64.zip` |
+| Linux (x86-64) | `piper_linux_x86_64.tar.gz` |
+| macOS (Apple Silicon) | `piper_macos_aarch64.tar.gz` |
+| macOS (Intel) | `piper_macos_x86_64.tar.gz` |
+
+Extract the archive and copy the executable into your mod directory:
+
+```
+<KIF game root>/
+└── Mods/
+    └── pokedex_voice_over/
+        └── piper/
+            ├── piper.exe   (Windows) or piper (Linux/macOS)
+            ├── model.onnx
+            └── model.onnx.json
+```
+
+> **Tip:** The mod also searches the system `PATH` for a `piper` executable if
+> you prefer a system-wide installation — just omit the local `piper/` folder.
+
+#### Step B — Obtain a Voice Model
+
+You need a Piper voice model in ONNX format.  There are two options:
+
+**Option 1 — Pre-trained English voice (quick start)**
+
+Download any English voice model from the
+[Piper voices repository](https://huggingface.co/rhasspy/piper-voices/tree/main/en)
+and place `*.onnx` and `*.onnx.json` in `Mods/pokedex_voice_over/piper/`,
+renaming them to `model.onnx` and `model.onnx.json`.  The voice won't sound
+exactly like Dexter, but it will read the entry text clearly.
+
+**Option 2 — Custom Dexter voice (recommended)**
+
+Train a voice model on your existing pre-recorded `dex_*.ogg` files so the
+TTS sounds like the Dexter narrator.  See [Training a Custom Dexter Voice](#training-a-custom-dexter-voice) below.
+
+#### Step C — Enable in Mod Settings
+
+The TTS fallback is **on by default** when Piper is detected.  To toggle it:
+
+**Options → Mod Settings → Interface → Pokédex Voice Over → TTS Fallback (Piper)**
+
+| Setting | Default | Description |
+|---|---|---|
+| **TTS Fallback (Piper)** | On | Use Piper to read entries with no pre-recorded audio |
+
+#### How It Works at Runtime
+
+1. When you open a fused Pokémon entry with no pre-recorded audio, the mod
+   generates a WAV file by piping the displayed text into Piper.
+2. The generated file is cached in `Audio/SE/Pokedex/tts_cache/` with a
+   deterministic filename derived from the text content.
+3. On the next visit to the same entry with the same text, the cached file is
+   played instantly — no generation delay.
+4. Cache files are small (~100–200 KB each) and can be safely deleted at any
+   time.  They are regenerated on demand.
+
+**Generation latency:** approximately 1–2 seconds on a modern CPU for a
+typical two-sentence Pokédex entry.  The Pokémon's cry plays first (during
+the `CRY_DELAY`), so there is no perceptible silent gap.
+
+---
+
+## Training a Custom Dexter Voice
+
+You already have an excellent source of training data — your pre-recorded
+`dex_*.ogg` files with matching transcripts in `dex_entry_map.json`.
+
+### Step 1 — Prepare the dataset
+
+```bash
+python tools/train_piper_voice.py --game-root /path/to/KIF
+```
+
+The script:
+
+1. Reads `dex_entry_map.json` for audio-to-text mappings
+2. Scans `Audio/SE/Pokedex/` for matching `.ogg` files
+3. Converts each OGG to a 22 050 Hz mono WAV using ffmpeg
+4. Writes an **LJSpeech-format** dataset to `tools/piper_training_data/`:
+
+```
+tools/piper_training_data/
+├── wavs/
+│   ├── dex_00001.wav
+│   ├── dex_00002.wav
+│   └── ...
+└── metadata.csv   (filename|text|normalized_text)
+```
+
+Options:
+
+```bash
+# Use 16 kHz (required by some Piper base models)
+python tools/train_piper_voice.py --game-root /path/to/KIF --sample-rate 16000
+
+# Include fusion entries (disabled by default — fusion text varies at runtime)
+python tools/train_piper_voice.py --game-root /path/to/KIF --include-fusions
+```
+
+**Requirements:** Python 3.8+, ffmpeg on PATH.
+
+### Step 2 — Train on Google Colab (free GPU)
+
+1. Install the Piper training package:
+
+   ```bash
+   pip install piper-train
+   ```
+
+2. Preprocess the dataset:
+
+   ```bash
+   python -m piper_train.preprocess \
+     --language en-us \
+     --input-dir tools/piper_training_data \
+     --output-dir tools/piper_training_data/preprocessed \
+     --sample-rate 22050
+   ```
+
+3. Open the official Piper training notebook on Google Colab:
+   [piper_train.ipynb](https://github.com/rhasspy/piper/blob/master/notebooks/piper_train.ipynb)
+
+   Upload your `preprocessed/` folder to Colab and follow the notebook
+   instructions.  Training time is typically **4–8 hours** on a free Colab T4
+   GPU for a dataset of ~1 000 utterances.
+
+### Step 3 — Export and install the model
+
+After training, export to ONNX:
+
+```bash
+python -m piper_train.export_onnx \
+  --checkpoint path/to/checkpoint.ckpt \
+  --output model.onnx
+```
+
+Copy the two output files to your mod's piper directory:
+
+```
+Mods/pokedex_voice_over/piper/
+├── model.onnx
+└── model.onnx.json
+```
+
+The mod auto-detects the model on the next game launch.
+
+### Training Data Requirements
+
+| Hours of audio | Expected voice quality |
+|---|---|
+| < 30 min | Intelligible but robotic |
+| 1–2 hours | Good — clearly voice-cloned |
+| 2–4 hours | Excellent — near-indistinguishable |
+| 4+ hours | Best possible quality |
+
+> **Note:** A pre-trained Dexter voice model may be provided in a future
+> release of this mod, eliminating the need to train your own.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -334,6 +528,11 @@ TTS audio is saved without effects.
 | Voice cuts off mid-sentence | Normal for the ME channel — the full file plays but in-game ME events can interrupt it |
 | Mod not loading | Ensure `Mods/pokedex_voice_over/mod.json` and `main.rb` are both present |
 | Game crashes on launch with `require "json"` error | Update to the latest version of the mod.  Older versions used a bare `require "json"` which crashes on KIF's MKXP-EX runtime.  The current version includes a built-in fallback JSON parser that handles this automatically. |
+| Piper TTS is not reading entries | Check `debug.log` for `piper_available? => false`.  Verify `piper.exe` (or `piper`) and `model.onnx` are in `Mods/pokedex_voice_over/piper/`.  Also confirm "TTS Fallback (Piper)" is On in Mod Settings. |
+| Piper TTS reads entries but sounds wrong | The default voice model may not match Dexter's style.  Train a custom voice using `tools/train_piper_voice.py` — see [Training a Custom Dexter Voice](#training-a-custom-dexter-voice). |
+| Piper TTS has a 1–2 second delay before speaking | This is normal for on-the-fly generation.  Once generated, the file is cached and plays instantly on every subsequent visit to that entry. |
+| TTS cache is taking up disk space | Cache files live in `Audio/SE/Pokedex/tts_cache/` — each is ~100–200 KB.  Delete the folder at any time; files are regenerated on demand. |
+| `train_piper_voice.py` fails with "ffmpeg not found" | Install ffmpeg and add it to PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html). |
 
 ---
 
@@ -347,6 +546,7 @@ KIF-Pokedex-Voice-Over/
 │       └── main.rb             ← Ruby plugin (hooks Pokédex scene + plays audio)
 ├── tools/
 │   ├── generate_voices.py      ← Python script to generate TTS audio files
+│   ├── train_piper_voice.py    ← Python script to prepare Piper training data
 │   └── requirements.txt        ← Python dependencies
 └── README.md
 ```
