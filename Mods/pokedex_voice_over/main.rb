@@ -106,9 +106,9 @@ module PokedexVoiceOver
   # cry to finish before the Pokédex entry is read aloud.
   CRY_DELAY = 0.3
 
-  # Subfolder inside Audio/SE/Pokedex/ where Piper-generated TTS cache files
-  # are stored.  Each unique entry text gets its own deterministic filename.
-  TTS_CACHE_SUBDIR = "#{AUDIO_SUBDIR}/tts_cache"
+  # Sub-folder name (inside Audio/SE/Pokedex/) for Piper-generated TTS cache
+  # files.  Each unique entry text gets its own deterministic filename.
+  TTS_CACHE_SUBDIR = "tts_cache"
 
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
@@ -205,9 +205,10 @@ module PokedexVoiceOver
     @tts_model_path = candidates.find { |p| FileTest.exist?(p) }
   end
 
-  # Absolute directory used for TTS cache files (e.g. Audio/SE/Pokedex/tts_cache/).
+  # Absolute directory used for TTS cache files:
+  # Audio/SE/Pokedex/tts_cache/
   def self.tts_cache_dir
-    "Audio/SE/#{TTS_CACHE_SUBDIR}"
+    "Audio/SE/#{AUDIO_SUBDIR}/#{TTS_CACHE_SUBDIR}"
   end
 
   # Returns true when both the Piper executable and a voice model exist on disk.
@@ -235,13 +236,13 @@ module PokedexVoiceOver
   # Returns a bare audio path (relative to Audio/SE/) without extension,
   # e.g. "Pokedex/tts_cache/dex_tts_a1b2c3d4".
   def self._tts_cache_path(text)
-    hash = 2166136261  # FNV-1a 32-bit offset basis
+    hash = 0x811c9dc5  # FNV-1a 32-bit offset basis (2166136261)
     text.each_byte do |b|
       hash ^= b
-      hash = (hash * 16777619) & 0xFFFFFFFF
+      hash = (hash * 0x01000193) & 0xFFFFFFFF  # FNV prime (16777619)
     end
     hex = hash.to_s(16).rjust(8, "0")
-    "#{TTS_CACHE_SUBDIR}/dex_tts_#{hex}"
+    "#{AUDIO_SUBDIR}/#{TTS_CACHE_SUBDIR}/dex_tts_#{hex}"
   end
 
   # Generate a WAV file via Piper TTS for *text* and return the bare audio
