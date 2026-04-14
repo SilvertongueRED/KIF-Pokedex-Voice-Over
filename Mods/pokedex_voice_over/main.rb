@@ -1221,9 +1221,13 @@ if defined?(PokemonPokedexInfo_Scene)
             body_id = composite % nb_pokemon
             head_id = composite / nb_pokemon
             if head_id > 0 && body_id > 0
-              PokedexVoiceOver.log("  Detected fused species ID #{composite} => head=#{head_id}, body=#{body_id} (NB_POKEMON=#{nb_pokemon})")
-              fused = body_id
-              head = head_id
+              # In KIF's composite encoding, composite = first_species * NB_POKEMON + second_species.
+              # The remainder (body_id) is the second species, which is the *visual head* of the fusion
+              # (the Pokémon whose head appears on the sprite). Audio files are named dex_HEAD_BODY,
+              # so we assign head = body_id (visual head) and fused = head_id (visual body/partner).
+              PokedexVoiceOver.log("  Detected fused species ID #{composite} => head=#{body_id}, body=#{head_id} (NB_POKEMON=#{nb_pokemon})")
+              head = body_id
+              fused = head_id
             end
           end
         end
@@ -1482,7 +1486,10 @@ if defined?(PokemonPokedexInfo_Scene)
           nb = PokedexVoiceOver.nb_pokemon
           composite = nil
           if nb && nb > 0 && head.is_a?(Integer) && fused.is_a?(Integer)
-            composite = head * nb + fused
+            # Reconstruct the original KIF composite: first_species * NB_POKEMON + second_species.
+            # After the decomposition fix, head = second_species (visual head) and
+            # fused = first_species (visual body/partner), so the composite is fused * nb + head.
+            composite = fused * nb + head
           end
           if composite
             begin
@@ -1542,7 +1549,8 @@ if defined?(PokemonPokedexInfo_Scene)
             if head && fused
               nb = PokedexVoiceOver.nb_pokemon
               if nb && nb > 0 && head.is_a?(Integer) && fused.is_a?(Integer)
-                composite = head * nb + fused
+                # Reconstruct the original KIF composite: fused * nb + head (see Strategy 5 for rationale).
+                composite = fused * nb + head
                 val = pbGetMessage(MessageTypes::Entries, composite) rescue nil
                 if val.is_a?(String) && !val.strip.empty? && val.strip.length > 10
                   text = val
