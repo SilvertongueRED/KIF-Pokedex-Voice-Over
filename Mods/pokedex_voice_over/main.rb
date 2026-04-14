@@ -661,6 +661,90 @@ module PokedexVoiceOver
         result = _try_match.call(resolver, "POKENAME-resolved ")
         return result if result
       end
+
+      # --- Pass 3: POKENAME portmanteau mismatch fallback -------------------
+      # KIF's runtime portmanteau algorithm may differ from the mod's
+      # _make_fusion_name (producing e.g. "Bulbagey" vs "PIDasaur").
+      # When Pass 2 still fails, strip POKENAME from the entry_map text and
+      # strip the first capitalized word from the displayed text — if the rest
+      # of the content matches, we have a reliable hit despite the name diff.
+      if has_pokename
+        log("  _match_variant: retrying with POKENAME stripped (nameless comparison)")
+        # Build a "nameless" version of the displayed text:
+        # remove the first word that could be the fusion's display name —
+        # a capitalized, all-letter word of at least 4 characters that is NOT
+        # a common English / Pokédex structural word.
+        common_words = %w[this that the a an is was are were has have had
+                           its it of in on at to for and or but with by
+                           from as when where which who what known called
+                           such very only also still once even they them
+                           their use uses using can could will would
+                           should may might must able been being become]
+        nameless_displayed = displayed_text.dup
+        # Strip the first word that looks like a Pokémon name
+        nameless_displayed = nameless_displayed.sub(/\b([A-Z][a-zA-Z]{3,})\b/) do |m|
+          common_words.include?(m.downcase) ? m : ""
+        end
+        norm_nameless_displayed = _normalize_text(nameless_displayed)
+        unless norm_nameless_displayed.empty?
+          nameless_resolver = lambda do |t|
+            next nil unless t
+            # Strip POKENAME from entry_map text
+            t.gsub(/POKENAME/i, "")
+          end
+          # Re-run _try_match using the nameless displayed text as the base
+          _try_match_nameless = lambda do |resolver2, tag2|
+            variants.each do |variant_bare|
+              stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+              map_text = resolver2.call(entry_map[stem])
+              next unless map_text
+              if _normalize_text(map_text) == norm_nameless_displayed
+                log("  _match_variant: #{tag2}nameless-exact match => #{variant_bare}")
+                return variant_bare
+              end
+            end
+            prefix_len = 40
+            if norm_nameless_displayed.length >= prefix_len
+              norm_prefix = norm_nameless_displayed[0, prefix_len]
+              variants.each do |variant_bare|
+                stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+                map_text = resolver2.call(entry_map[stem])
+                next unless map_text
+                if _normalize_text(map_text).start_with?(norm_prefix)
+                  log("  _match_variant: #{tag2}nameless-prefix match => #{variant_bare}")
+                  return variant_bare
+                end
+              end
+            end
+            displayed_words2 = norm_nameless_displayed.split(" ").select { |w| w.length >= 4 }.uniq
+            if displayed_words2.length >= 2
+              best_v2 = nil
+              best_r2 = 0.0
+              variants.each do |variant_bare|
+                stem = variant_bare.sub(/\A#{Regexp.escape(AUDIO_SUBDIR)}\//, "")
+                map_text = resolver2.call(entry_map[stem])
+                next unless map_text
+                norm_map = _normalize_text(map_text)
+                map_words2 = norm_map.split(" ").select { |w| w.length >= 4 }.uniq
+                next if map_words2.empty?
+                common2 = (displayed_words2 & map_words2).length
+                ratio2 = common2.to_f / [displayed_words2.length, map_words2.length].max
+                if ratio2 > best_r2
+                  best_r2 = ratio2
+                  best_v2 = variant_bare
+                end
+              end
+              if best_v2 && best_r2 >= 0.35
+                log("  _match_variant: #{tag2}nameless-word-overlap (ratio=#{best_r2.round(2)}) => #{best_v2}")
+                return best_v2
+              end
+            end
+            nil
+          end
+          result = _try_match_nameless.call(nameless_resolver, "POKENAME-stripped ")
+          return result if result
+        end
+      end
     end
 
     log("  _match_variant: no match found")
@@ -792,30 +876,39 @@ module PokedexVoiceOver
         bare_body = "#{AUDIO_SUBDIR}/dex_#{fused}"
 
         if fusion_variants.any?
-          matched = _match_variant(fusion_variants, displayed_text, species, fused_species)
-          if matched.nil? && fusion_variants.length > 1 && entry_map.empty?
-            log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map.")
-          end
-          if matched
-            chosen_file = matched
+          if fusion_variants.length == 1
+            # Only one variant exists — play it directly without text matching.
+            # Text matching is only valuable when there are multiple variants to
+            # choose between; with a single file it is the only option regardless.
+            chosen_file = fusion_variants.first
             playback_mode = :single
-            log("  Playing fusion audio: #{chosen_file} (from #{fusion_variants.length} variant(s), matched=true)")
+            log("  Playing fusion audio: #{chosen_file} (1 variant, skipping text match)")
           else
-            # No variant matched — the displayed text is likely a mashed base-species
-            # entry (the game randomly combined sentences from both base Pokémon).
-            # Playing a random custom fusion audio file would be out of sync with
-            # what's on screen, so prefer sequential base-species playback instead.
-            if _audio_exists?(bare_head) && _audio_exists?(bare_body)
-              seq_head = bare_head
-              seq_body = bare_body
-              seq_head_dur = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
-              playback_mode = :sequential
-              log("  No variant match — displayed text appears to be a mashed base-species entry. Falling back to sequential base-species playback: #{seq_head} then #{seq_body}")
-            else
-              # Base species files not available — fall back to random fusion variant
-              chosen_file = fusion_variants.sample
+            matched = _match_variant(fusion_variants, displayed_text, species, fused_species)
+            if matched.nil? && entry_map.empty?
+              log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map.")
+            end
+            if matched
+              chosen_file = matched
               playback_mode = :single
-              log("  No variant match and no base species audio — playing random fusion variant: #{chosen_file} (from #{fusion_variants.length} variant(s))")
+              log("  Playing fusion audio: #{chosen_file} (from #{fusion_variants.length} variant(s), matched=true)")
+            else
+              # No variant matched — the displayed text is likely a mashed base-species
+              # entry (the game randomly combined sentences from both base Pokémon).
+              # Playing a random custom fusion audio file would be out of sync with
+              # what's on screen, so prefer sequential base-species playback instead.
+              if _audio_exists?(bare_head) && _audio_exists?(bare_body)
+                seq_head = bare_head
+                seq_body = bare_body
+                seq_head_dur = (durations["dex_#{base}.ogg"] || SEQUENTIAL_DURATION_FALLBACK).to_f
+                playback_mode = :sequential
+                log("  No variant match — displayed text appears to be a mashed base-species entry. Falling back to sequential base-species playback: #{seq_head} then #{seq_body}")
+              else
+                # Base species files not available — fall back to random fusion variant
+                chosen_file = fusion_variants.sample
+                playback_mode = :single
+                log("  No variant match and no base species audio — playing random fusion variant: #{chosen_file} (from #{fusion_variants.length} variant(s))")
+              end
             end
           end
         else
@@ -900,11 +993,10 @@ module PokedexVoiceOver
           when :single
             _play_bare(chosen_file)
           when :sequential
-            Audio.se_stop
-            Audio.se_play(seq_head, play_vol, 100)
+            _play_bare(seq_head)
             _interruptible_sleep(seq_head_dur, my_gen)
             if @playback_gen == my_gen
-              Audio.se_play(seq_body, play_vol, 100)
+              _play_bare(seq_body)
             end
           end
 
