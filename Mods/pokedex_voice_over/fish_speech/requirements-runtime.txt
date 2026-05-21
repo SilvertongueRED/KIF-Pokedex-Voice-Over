@@ -41,7 +41,8 @@ rich>=13.5.3
 
 # --- audio I/O + setup-time helpers ---
 soundfile>=0.12
-librosa>=0.10.1                    # setup.py uses it to normalise the reference WAV
+# librosa removed: reference resampling now uses torchaudio
+# (avoids numba/llvmlite/scipy, ~250 MB).  See setup.py prepare_reference().
 huggingface_hub>=0.23              # setup.py uses it to download the model weights
 loguru>=0.6.0
 natsort>=8.4.0

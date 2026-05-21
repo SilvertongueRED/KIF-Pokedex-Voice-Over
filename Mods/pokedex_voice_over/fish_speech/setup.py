@@ -249,7 +249,7 @@ def install_fish_speech() -> None:
     # Representative leaf modules: if these all import, the runtime set is in.
     probe = ["torch", "transformers", "tiktoken", "vector_quantize_pytorch",
              "hydra", "omegaconf", "pydantic", "loguru", "soundfile",
-             "librosa", "huggingface_hub", "lightning", "pytorch_lightning"]
+             "torchaudio", "huggingface_hub", "lightning", "pytorch_lightning"]
     missing = [m for m in probe if not _module_importable(m)]
     if not missing:
         ok("Inference dependencies already installed - skipping.")
@@ -323,9 +323,8 @@ def prepare_reference(provided: Path | None) -> None:
     try:
         import soundfile as sf
         import numpy as np
-        import librosa
     except ImportError:
-        warn("soundfile/librosa not installed — copying reference verbatim.")
+        warn("soundfile not installed — copying reference verbatim.")
         if src and src != REFERENCE_WAV:
             shutil.copy2(src, REFERENCE_WAV)
         return
@@ -336,8 +335,13 @@ def prepare_reference(provided: Path | None) -> None:
             data = data.mean(axis=1)            # downmix to mono
         target_sr = 44100
         if sr != target_sr:
-            data = librosa.resample(data.astype("float32"), orig_sr=sr,
-                                    target_sr=target_sr)
+            # Resample with torchaudio (already a required runtime dep) so we
+            # do not need librosa (numba/llvmlite/scipy, ~250 MB) at all.
+            import torch, torchaudio
+            wav = torch.from_numpy(np.ascontiguousarray(data)).float().unsqueeze(0)
+            wav = torchaudio.functional.resample(wav, orig_freq=sr,
+                                                 new_freq=target_sr)
+            data = wav.squeeze(0).contiguous().numpy()
             sr = target_sr
         # Cap at 30 seconds — fish-speech doesn't benefit from longer prompts
         max_samples = sr * 30
@@ -374,10 +378,101 @@ def smoke_test() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Post-install slimming (safe; idempotent)
+# ---------------------------------------------------------------------------
+# A clean install from requirements-runtime.txt no longer pulls these, but an
+# env upgraded in place from an older (pre-vendoring) setup may still carry
+# them.  None are imported by the inference path; librosa/numba/llvmlite go now
+# that reference resampling uses torchaudio.
+NON_RUNTIME_PACKAGES = [
+    "librosa", "numba", "llvmlite",
+    "gradio", "gradio_client", "wandb", "modelscope",
+    "tensorboard", "tensorboard-data-server",
+    "pandas", "pyarrow", "scikit-learn", "matplotlib",
+    "silero-vad", "silero_vad", "faster-whisper", "funasr",
+    "datasets", "jedi",
+]
+
+
+def _human(n: float) -> str:
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.1f} {unit}"
+        n /= 1024
+    return f"{n:.1f} GB"
+
+
+def _dir_size(path: Path) -> int:
+    total = 0
+    for p in path.rglob("*"):
+        try:
+            if p.is_file() and not p.is_symlink():
+                total += p.stat().st_size
+        except OSError:
+            pass
+    return total
+
+
+def _site_packages() -> Path:
+    base = Path(sys.executable).resolve().parent
+    cand = base / "Lib" / "site-packages"
+    if cand.exists():
+        return cand
+    found = list(base.rglob("site-packages"))
+    return found[0] if found else cand
+
+
+def slim_install() -> None:
+    """Trim the install to the inference-only footprint.
+
+    Idempotent and safe to run after every (re)install.  It (1) uninstalls
+    packages the inference path never imports, (2) deletes torch's compile-only
+    artefacts (*.lib, C++ headers, bundled tests), and (3) drops __pycache__ and
+    packaged test suites.  It never touches the CUDA runtime DLLs or the model
+    weights, so GPU inference and clone fidelity are unchanged.
+    """
+    info("Slimming the install to the inference-only footprint...")
+    site = _site_packages()
+    before = _dir_size(site) if site.exists() else 0
+
+    present = [p for p in NON_RUNTIME_PACKAGES if _pip_has_distribution(p)]
+    if present:
+        info(f"Uninstalling {len(present)} non-runtime package(s): "
+             f"{', '.join(present)}")
+        run_pip_uninstall(present)
+
+    torch_lib = site / "torch" / "lib"
+    if torch_lib.exists():
+        for f in torch_lib.glob("*.lib"):
+            try:
+                f.unlink()
+            except OSError:
+                pass
+    for sub in ("include", "test", "testing", "_C_tests"):
+        d = site / "torch" / sub
+        if d.exists():
+            shutil.rmtree(d, ignore_errors=True)
+
+    for pyc in site.rglob("__pycache__"):
+        shutil.rmtree(pyc, ignore_errors=True)
+    for tests in list(site.glob("*/tests")) + list(site.glob("*/test")):
+        if tests.is_dir():
+            shutil.rmtree(tests, ignore_errors=True)
+
+    after = _dir_size(site) if site.exists() else 0
+    if before:
+        ok(f"Slimmed env: {_human(before)} -> {_human(after)} "
+           f"(freed ~{_human(max(before - after, 0))})")
+    else:
+        ok("Slim pass complete.")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
 def main() -> int:
+
     parser = argparse.ArgumentParser(description="Fish-Speech setup")
     parser.add_argument("--reference", type=Path, default=None,
                         help="Path to your reference Pokédex-voice WAV "
@@ -394,6 +489,9 @@ def main() -> int:
                         help="HuggingFace access token (only if repo is gated).")
     parser.add_argument("--force-cpu", action="store_true",
                         help="Install CPU-only torch even if CUDA is available.")
+    parser.add_argument("--no-slim", action="store_true",
+                        help="Skip the post-install slimming pass (keeps torch "
+                             "headers/.lib and any dev packages installed).")
     args = parser.parse_args()
 
     info(f"Platform: {platform.platform()}")
@@ -429,6 +527,9 @@ def main() -> int:
 
     if not args.skip_smoke:
         smoke_test()
+
+    if not args.skip_install and not args.no_slim:
+        slim_install()
 
     print()
     ok("All done.  Launch the server with:")
