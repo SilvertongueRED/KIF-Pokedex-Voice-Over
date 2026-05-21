@@ -112,4 +112,19 @@ if not "!FISHTTS_EXIT!"=="0" (
     echo Press any key to close this window.
     pause >nul
 )
-endlocal
+
+REM ---------------------------------------------------------------------------
+REM Step 4: close this wrapper terminal once the server process has ended.
+REM
+REM When the game exits, server.py's --parent-pid monitor shuts the Python
+REM server down cleanly (exit code 0) and control returns here.  We must NOT
+REM rely on `start "FishSpeechTTS" Start_TTS_Server.bat` auto-closing its own
+REM window: depending on the Windows shell / .bat file-association config, the
+REM hosting cmd.exe can drop to an idle "C:\...>" prompt after the batch
+REM finishes instead of terminating, which is exactly what leaves an orphaned
+REM "FishSpeechTTS" terminal onscreen long after the game (and the server) are
+REM already gone.  A bare `exit` terminates this cmd.exe outright, closing the
+REM window in every case.  On the error path above we `pause` first so the user
+REM can read the message, THEN fall through here to close.
+REM ---------------------------------------------------------------------------
+endlocal & exit
