@@ -1,0 +1,54 @@
+# =============================================================================
+# Line-ending & diff policy for KIF-Pokedex-Voice-Over
+# =============================================================================
+# Normalise text files to LF in the repo so Windows/macOS/Linux clones don't
+# introduce CRLF/LF churn.  Crucially this keeps the VENDORED fish-speech 1.5
+# engine (Mods/pokedex_voice_over/fish_speech/vendor/) byte-identical for
+# everyone who clones, regardless of their git core.autocrlf setting - a stray
+# CRLF rewrite there could corrupt the pinned engine the mod loads at runtime.
+#
+# After adding this file, renormalise the existing tree once:
+#     git add --renormalize .
+#     git commit -m "Normalise line endings via .gitattributes"
+# =============================================================================
+
+# Default: let git detect text vs binary and store text as LF in the repo.
+* text=auto
+
+# --- Vendored fish-speech 1.5 engine: force LF on checkout, never CRLF -------
+# (The bundled embeddable Python reads LF fine on Windows.)
+Mods/pokedex_voice_over/fish_speech/vendor/** text eol=lf
+
+# --- Source & config: explicit LF -------------------------------------------
+*.py    text eol=lf
+*.rb    text eol=lf
+*.sh    text eol=lf
+*.json  text eol=lf
+*.yaml  text eol=lf
+*.yml   text eol=lf
+*.proto text eol=lf
+*.md    text eol=lf
+*.txt   text eol=lf
+*.cfg   text eol=lf
+*.toml  text eol=lf
+
+# --- Windows batch files need CRLF ------------------------------------------
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# --- Binary blobs: never line-ending-converted, never diffed ----------------
+*.pt          binary
+*.pth         binary
+*.bin         binary
+*.pkl         binary
+*.ckpt        binary
+*.safetensors binary
+*.tiktoken    binary
+*.wav         binary
+*.ogg         binary
+*.mp3         binary
+*.onnx        binary
+*.zip         binary
+*.npy         binary
+*.npz         binary
+*.pyc         binary

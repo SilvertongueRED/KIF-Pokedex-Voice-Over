@@ -1,0 +1,9 @@
+# Runtime dependencies for the Fish-Speech sidecar.
+# torch + torchaudio are installed separately by setup.py because the right
+# wheels depend on CPU vs CUDA — do NOT pin them here.
+
+fish-speech==1.5.*
+huggingface_hub>=0.23
+numpy>=1.24
+soundfile>=0.12
+librosa>=0.10

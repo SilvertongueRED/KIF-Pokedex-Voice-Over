@@ -1,10 +1,10 @@
 {
   "name": "Pokédex Voice Over",
   "id": "pokedex_voice_over",
-  "version": "1.8.0",
+  "version": "2.0.1",
   "author": "SilvertongueRED",
-  "description": "Reads Pokédex entries aloud in the style of Dexter, the classic Pokémon anime Pokédex narrator, whenever you open a Pokémon's Pokédex entry — including all fused variants. Supports multiple entry variants for fusions.",
-  "tags": ["Audio", "QoL", "Fusion"],
+  "description": "Reads every Pokédex entry aloud in the style of Dexter, the classic anime narrator. Ships an offline Fish-Speech voice-clone sidecar with a bundled portable Python 3.12 — no admin, no PATH changes, no SmartScreen prompts. First launch installs torch + fish-speech and downloads the ~1.4 GB voice-clone model from Hugging Face; everything after that runs fully offline with zero network calls and no API keys.",
+  "tags": ["Audio", "QoL", "Fusion", "TTS"],
   "scripts": ["main.rb"],
   "settings": [
     {
@@ -33,6 +33,24 @@
       "label": "Re-read on Page Return",
       "type": "toggle",
       "default": false
+    },
+    {
+      "key": "fish_speech_enabled",
+      "label": "Fish-Speech Voice (Primary)",
+      "type": "toggle",
+      "default": true
+    },
+    {
+      "key": "fish_speech_autostart",
+      "label": "Auto-Start Fish-Speech Server",
+      "type": "toggle",
+      "default": true
+    },
+    {
+      "key": "tts_enabled",
+      "label": "TTS Fallback (Piper)",
+      "type": "toggle",
+      "default": true
     }
   ]
 }

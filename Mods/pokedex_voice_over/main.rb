@@ -104,11 +104,35 @@ module PokedexVoiceOver
 
   # Delay (seconds) before voice-over playback begins, allowing the Pokémon's
   # cry to finish before the Pokédex entry is read aloud.
-  CRY_DELAY = 0.3
+  CRY_DELAY = 1.0
 
-  # Sub-folder name (inside Audio/SE/Pokedex/) for Piper-generated TTS cache
-  # files.  Each unique entry text gets its own deterministic filename.
+  # Sub-folder name (inside Audio/SE/Pokedex/) for TTS-generated cache
+  # files (Fish-Speech or Piper).  Each unique entry text gets its own
+  # deterministic filename so re-visits are instant.
   TTS_CACHE_SUBDIR = "tts_cache"
+
+  # -------------------------------------------------------------------------
+  # Fish-Speech sidecar (primary TTS backend)
+  # -------------------------------------------------------------------------
+  # Fish-Speech is an open-source voice-cloning TTS engine - the same engine
+  # that powers fish.audio.  It runs as a small persistent HTTP server in the
+  # fish_speech/ subfolder so the model stays loaded between requests (a
+  # cold start takes ~10-30s; per-request inference is ~0.5s GPU / 3-8s CPU).
+  #
+  # We talk to it over plain HTTP on localhost via raw TCPSocket calls.
+  # MKXP-Z's embedded Ruby does not ship net/http, so we use TCPSocket directly.
+  FISH_SPEECH_HOST = "127.0.0.1"
+  FISH_SPEECH_PORT = 7861
+  FISH_SPEECH_DIR  = "Mods/pokedex_voice_over/fish_speech"
+
+  # How long (seconds) to wait for /tts to return a WAV.  Fish-Speech needs a
+  # generous ceiling on slower CPUs - entries with several sentences can take
+  # 10-30s.  After this we fall through to Piper.
+  FISH_SPEECH_TIMEOUT = 45
+
+  # Health-check timeout (seconds) - should be very short; the endpoint is
+  # purely informational and returns instantly.
+  FISH_SPEECH_HEALTH_TIMEOUT = 1
 
   # Diagnostic log file — always written so users can report issues.
   LOG_FILE = "Mods/pokedex_voice_over/debug.log"
@@ -179,6 +203,29 @@ module PokedexVoiceOver
     settings.fetch("tts_enabled", true)
   end
 
+  # Returns true if the Fish-Speech sidecar is allowed to be used as the
+  # primary TTS backend (default: on).  When this is on the mod prefers
+  # Fish-Speech over pre-recorded audio and over Piper.
+  def self.fish_speech_enabled?
+    if defined?(ModSettingsMenu)
+      val = ModSettingsMenu.get(:pokedex_vo_fish_speech_enabled)
+      return val == 1 if !val.nil?
+    end
+    settings.fetch("fish_speech_enabled", true)
+  end
+
+  # Returns true if the mod is allowed to auto-launch the Fish-Speech
+  # server on first use (default: on).  When off, the user must launch
+  # Start_TTS_Server.bat / start_tts_server.sh manually before opening
+  # the Pokedex.
+  def self.fish_speech_autostart?
+    if defined?(ModSettingsMenu)
+      val = ModSettingsMenu.get(:pokedex_vo_fish_speech_autostart)
+      return val == 1 if !val.nil?
+    end
+    settings.fetch("fish_speech_autostart", true)
+  end
+
   # -------------------------------------------------------------------------
   # Piper TTS auto-detection helpers (cached after first call)
   # -------------------------------------------------------------------------
@@ -209,6 +256,19 @@ module PokedexVoiceOver
   # Audio/SE/Pokedex/tts_cache/
   def self.tts_cache_dir
     "Audio/SE/#{AUDIO_SUBDIR}/#{TTS_CACHE_SUBDIR}"
+  end
+
+  # Recursively create a directory path (like FileUtils.mkdir_p).
+  # Dir.mkdir only creates one level; this walks each component in turn.
+  def self._mkdir_p(path)
+    parts = path.gsub("\\", "/").split("/")
+    (1..parts.length).each do |i|
+      dir = parts[0, i].join("/")
+      next if dir.empty? || FileTest.exist?(dir)
+      Dir.mkdir(dir)
+    end
+  rescue => e
+    raise e
   end
 
   # Returns true when both the Piper executable and a voice model exist on disk.
@@ -258,7 +318,7 @@ module PokedexVoiceOver
 
     # Ensure the cache subdirectory exists
     begin
-      Dir.mkdir(tts_cache_dir) unless FileTest.exist?(tts_cache_dir)
+      _mkdir_p(tts_cache_dir)
     rescue => e
       log("  _generate_tts: could not create cache dir: #{e.message}")
       return nil
@@ -328,6 +388,376 @@ module PokedexVoiceOver
     rescue => e
       log("  _tts_audio_duration error: #{e.message}")
       SEQUENTIAL_DURATION_FALLBACK
+    end
+  end
+
+  # -------------------------------------------------------------------------
+  # Fish-Speech HTTP client - primary TTS backend
+  # -------------------------------------------------------------------------
+  # The sidecar (Mods/pokedex_voice_over/fish_speech/server.py) exposes:
+  #   GET  http://127.0.0.1:7861/health   -> {"ok": true|false, ...}
+  #   POST http://127.0.0.1:7861/tts      body: text=...  -> audio/wav
+  #
+  # We hit /health every time before /tts because polling is cheap and
+  # lets us silently fall through to Piper without timing out a real
+  # synthesis request when the server is not running.
+
+  # Returns true when the Fish-Speech sidecar is reachable AND reports ready.
+  # Cached for one minute so repeat dex entries do not re-poll.
+  def self.fish_speech_available?
+    now = Time.now.to_f
+    if defined?(@fish_speech_ok_at) && @fish_speech_ok_at && (now - @fish_speech_ok_at) < 60
+      return @fish_speech_ok
+    end
+    @fish_speech_ok = _fish_speech_ping
+    @fish_speech_ok_at = now
+    @fish_speech_ok
+  end
+
+  # Force a re-check on the next call (e.g. after auto-launch).
+  def self._fish_speech_invalidate
+    @fish_speech_ok = nil
+    @fish_speech_ok_at = nil
+  end
+
+  # Ask the local Fish-Speech sidecar to shut itself down.  Called from the
+  # at_exit hook at the bottom of this file when the game is closing so the
+  # terminal/console window the sidecar runs in goes away with the game.
+  # Best-effort: a connection error here just means the server is already
+  # gone (manual stop, crash, never started, etc.), which is fine.
+  def self._fish_speech_shutdown
+    return unless defined?(@fish_speech_shutdown_sent) ? !@fish_speech_shutdown_sent : true
+    @fish_speech_shutdown_sent = true
+    begin
+      # Use a very short timeout — we don't care about the response, and the
+      # server will close its socket as soon as we send the request.
+      _tcp_post(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/shutdown",
+                "", content_type: "application/x-www-form-urlencoded", timeout: 2)
+      log("Fish-Speech shutdown request sent")
+    rescue Exception => e
+      log("Fish-Speech shutdown error (server probably already stopped): #{e.class}: #{e.message}") rescue nil
+    end
+    # Belt-and-braces: also try to kill the process by PID file in case the
+    # HTTP shutdown didn't take effect (e.g. server hung mid-generation).
+    _fish_speech_kill_by_pid_file rescue nil
+  end
+
+  # Read fish_speech/server.pid (written by server.py on startup) and try to
+  # terminate that process directly.  Used as a fallback when the /shutdown
+  # HTTP request didn't free the port — and to clean up zombie servers from
+  # a previous run that wasn't shut down properly.
+  def self._fish_speech_kill_by_pid_file
+    win = RUBY_PLATFORM.to_s =~ /mswin|mingw|windows/i
+
+    # On Windows, the python.exe PID written into server.pid is a CHILD of
+    # the cmd.exe wrapper window we spawned with `start "FishSpeechTTS" ...`.
+    # taskkill on the python PID alone leaves the cmd.exe window onscreen.
+    # Targeting the window TITLE catches both processes in one shot.
+    if win
+      begin
+        # /T kills the cmd.exe AND all its child processes (including python.exe).
+        # Without /T only cmd.exe is killed, leaving python orphaned on port 7861.
+        system(%Q{taskkill /F /T /FI "WindowTitle eq FishSpeechTTS*" >NUL 2>&1})
+      rescue => e
+        log("Window-title termination error: #{e.class}: #{e.message}")
+      end
+    end
+
+    pid_path = "#{FISH_SPEECH_DIR}/server.pid"
+    if FileTest.exist?(pid_path)
+      pid_str = File.read(pid_path).strip rescue nil
+      pid = (pid_str && !pid_str.empty?) ? pid_str.to_i : 0
+      if pid > 0
+        log("Attempting to terminate Fish-Speech server PID=#{pid}")
+        begin
+          if win
+            # /T also kills child processes — defensive in case the layout
+            # changes in a future launcher revision.
+            system(%Q{taskkill /F /T /PID #{pid} >NUL 2>&1})
+          else
+            Process.kill("TERM", pid) rescue nil
+            sleep 0.2
+            Process.kill("KILL", pid) rescue nil
+          end
+        rescue => e
+          log("PID-based termination error: #{e.class}: #{e.message}")
+        end
+      end
+      File.delete(pid_path) rescue nil
+    end
+  end
+
+  # Minimal raw-socket HTTP helpers.
+  # MKXP-Z's embedded Ruby does not ship net/http, but TCPSocket IS available.
+  # These replace Net::HTTP for the two endpoints we need (GET /health, POST /tts).
+
+  # ---------------------------------------------------------------------------
+  # Socket I/O with REAL timeouts (IO.select-based).
+  #
+  # The original implementation accepted a `timeout:` keyword but never wired
+  # it to the socket — `sock.read` blocks indefinitely.  When `/health` was
+  # called from the main thread that meant the game would freeze (hard,
+  # indistinguishable from a crash) if the Python server ever stalled.
+  #
+  # The helpers below use IO.select so each I/O operation actually times out,
+  # and on POST they use bounded read_nonblock loops so a runaway WAV cannot
+  # allocate unbounded memory inside MKXP-Z's MRI.
+  # ---------------------------------------------------------------------------
+  MAX_TTS_RESPONSE_BYTES = 16 * 1024 * 1024  # 16 MB cap on /tts response
+
+  def self._connect_with_timeout(host, port, connect_timeout)
+    require "socket"
+    begin
+      # Ruby >= 2.6 ships Socket.tcp with built-in connect_timeout support,
+      # which MKXP-Z's bundled Ruby 3.1 has.  This is the only way to put a
+      # real wall-clock on the TCP handshake itself.
+      Socket.tcp(host, port, connect_timeout: connect_timeout)
+    rescue NoMethodError, ArgumentError
+      # Older Rubies — fall back to plain TCPSocket.new.  The connect call
+      # itself isn't timeoutable, but localhost ECONNREFUSED is instant.
+      TCPSocket.new(host, port)
+    end
+  end
+
+  # Read at most max_bytes from sock, raising IO::TimeoutError if the
+  # connection produces no data for more than read_timeout seconds.
+  # Returns the bytes read so far if the peer closes cleanly.
+  def self._read_bounded(sock, max_bytes, read_timeout)
+    buf = "".force_encoding("BINARY")
+    loop do
+      ready = IO.select([sock], nil, nil, read_timeout)
+      raise IO::TimeoutError, "read timed out after #{read_timeout}s" if ready.nil?
+      begin
+        chunk = sock.read_nonblock(64 * 1024, exception: false)
+      rescue EOFError
+        return buf
+      end
+      case chunk
+      when :wait_readable
+        next
+      when nil
+        return buf
+      else
+        buf << chunk
+        return buf if buf.bytesize >= max_bytes
+      end
+    end
+  end
+
+  # Issue a GET request; returns the response body string or nil on failure.
+  def self._tcp_get(host, port, path, timeout: 3)
+    require "socket"
+    sock = _connect_with_timeout(host, port, timeout)
+    sock.write("GET #{path} HTTP/1.0\r\nHost: #{host}:#{port}\r\nConnection: close\r\n\r\n")
+    raw = _read_bounded(sock, 64 * 1024, timeout)
+    return nil unless raw
+    sep = raw.index("\r\n\r\n")
+    return nil unless sep
+    status = raw.split("\r\n", 2).first.to_s.split(" ", 3)[1].to_i
+    return nil unless status == 200
+    raw[sep + 4..]
+  rescue Exception => e
+    log("  _tcp_get #{host}:#{port}#{path} error: #{e.class}: #{e.message}") rescue nil
+    nil
+  ensure
+    sock&.close rescue nil
+  end
+
+  # Issue a POST request with a raw body; returns the response body (binary-safe)
+  # or nil on failure.
+  def self._tcp_post(host, port, path, body_str, content_type: "application/x-www-form-urlencoded", timeout: 60)
+    require "socket"
+    body_bytes = body_str.force_encoding("BINARY")
+    req = "POST #{path} HTTP/1.0\r\n" \
+          "Host: #{host}:#{port}\r\n" \
+          "Content-Type: #{content_type}\r\n" \
+          "Content-Length: #{body_bytes.bytesize}\r\n" \
+          "Connection: close\r\n" \
+          "\r\n"
+    # 5 s connect timeout is plenty for localhost; the long `timeout:` value
+    # only governs reading the response body.
+    sock = _connect_with_timeout(host, port, 5)
+    sock.write(req)
+    sock.write(body_bytes)
+    raw = _read_bounded(sock, MAX_TTS_RESPONSE_BYTES, timeout)
+    return nil unless raw
+    sep = raw.index("\r\n\r\n")
+    return nil unless sep
+    status = raw.split("\r\n", 2).first.to_s.split(" ", 3)[1].to_i
+    return nil unless status == 200
+    raw[sep + 4..]
+  rescue Exception => e
+    log("  _tcp_post #{host}:#{port}#{path} error: #{e.class}: #{e.message}") rescue nil
+    nil
+  ensure
+    sock&.close rescue nil
+  end
+
+  # Simple percent-encoder (replaces URI.encode_www_form_component).
+  def self._url_encode(str)
+    str.to_s.encode("UTF-8", invalid: :replace, undef: :replace).gsub(/[^A-Za-z0-9\-._~]/) do |c|
+      c.bytes.map { |b| "%%%02X" % b }.join
+    end
+  end
+
+  # Issue a quick GET /health and return true when the body says ok=true.
+  def self._fish_speech_ping
+    body = _tcp_get(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/health",
+                    timeout: FISH_SPEECH_HEALTH_TIMEOUT)
+    return false unless body
+    ok = body.include?('"ok"') && body.include?("true")
+    log("  fish-speech /health: #{body[0, 120]} => #{ok ? 'READY' : 'NOT READY'}")
+    ok
+  rescue Exception => e
+    log("  fish-speech /health unreachable: #{e.class}: #{e.message}") rescue nil
+    false
+  end
+
+  # Split a Pokédex entry into individual sentences for streaming TTS.
+  # Returns an Array of sentence strings; guaranteed to have at least one element.
+  # Short fragments (< 10 chars) are merged with the following sentence to avoid
+  # splitting on abbreviations like "Mr." or "No." that contain a period.
+  def self._split_sentences(text)
+    return [text] if text.nil? || text.strip.empty?
+    # Split after '.', '!', or '?' that are followed by whitespace.
+    parts = text.strip.split(/(?<=[.!?])\s+/)
+    return parts if parts.length <= 1
+    # Merge any very short fragment (abbreviation artifact) with the next sentence.
+    merged = []
+    parts.each do |p|
+      if !merged.empty? && merged.last.length < 10
+        merged[-1] = "#{merged.last} #{p}"
+      else
+        merged << p
+      end
+    end
+    merged.reject(&:empty?)
+  end
+
+  # Generate a WAV via Fish-Speech for *text* and return the bare audio path
+  # (relative to Audio/SE/, without extension) on success, or nil on failure.
+  # Files are cached by content hash so repeat visits are instant.
+  def self._generate_tts_fish_speech(text)
+    return nil if text.nil? || text.strip.empty?
+    return nil unless fish_speech_available?
+
+    cache_bare = _tts_cache_path(text)
+    cache_wav  = "Audio/SE/#{cache_bare}.wav"
+
+    # Cache hit - skip the HTTP round-trip entirely
+    if FileTest.exist?(cache_wav)
+      log("  _generate_tts_fish_speech: cache hit => #{cache_bare}")
+      return cache_bare
+    end
+
+    begin
+      _mkdir_p(tts_cache_dir)
+    rescue => e
+      log("  _generate_tts_fish_speech: could not create cache dir: #{e.message}")
+      return nil
+    end
+
+    log("  _generate_tts_fish_speech: requesting (#{text.length} chars)...")
+    started = Time.now.to_f
+
+    body = _tcp_post(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/tts",
+                     "text=#{_url_encode(text)}",
+                     timeout: FISH_SPEECH_TIMEOUT)
+
+    unless body && body.length > 44
+      log("  _generate_tts_fish_speech: bad/empty response")
+      _fish_speech_invalidate
+      return nil
+    end
+
+    # Write the WAV bytes to the cache file (binary mode!).
+    begin
+      File.open(cache_wav, "wb") { |f| f.write(body) }
+    rescue => e
+      log("  _generate_tts_fish_speech: failed to write WAV: #{e.message}")
+      return nil
+    end
+
+    elapsed = Time.now.to_f - started
+    log("  _generate_tts_fish_speech: success in #{elapsed.round(2)}s => #{cache_bare}")
+    cache_bare
+  end
+
+  # Best-effort launcher for the Fish-Speech sidecar.  Returns nothing.
+  # Called once when the mod realises the server is down but the user has
+  # auto-start enabled.  The server takes ~10-30s to load; we do not block -
+  # subsequent dex entries will pick it up once it is listening.
+  #
+  # NOTE on Windows spawning (regression fix after KIF mod-manager update):
+  # We used to do `start "TITLE" /MIN cmd /c "BAT --parent-pid N"`.  That
+  # wrapped the bat path inside an extra cmd /c quote layer, which cmd's
+  # quote-stripping rules mangle when the game CWD contains spaces,
+  # parentheses, and apostrophes — and Steam's default
+  #   C:\Program Files (x86)\Steam\steamapps\common\Kuray's Infinite Fusion (KIF)
+  # has all three.  After the KIF mod-manager update, system() now returns
+  # without raising but the cmd window silently dies before the bat runs.
+  # We now invoke the .bat directly via `start` with an ABSOLUTE path —
+  # no cmd /c wrapper, no relative-path / CWD coupling — and log the
+  # system() return value so future regressions are obvious.
+  def self._fish_speech_try_autostart
+    return if @fish_speech_autostart_attempted
+    @fish_speech_autostart_attempted = true
+    return unless fish_speech_autostart?
+
+    win = RUBY_PLATFORM.to_s =~ /mswin|mingw|windows/i
+    launcher_rel = win ? "#{FISH_SPEECH_DIR}/Start_TTS_Server.bat"
+                       : "#{FISH_SPEECH_DIR}/start_tts_server.sh"
+    unless FileTest.exist?(launcher_rel)
+      log("  fish-speech autostart: launcher not found at #{launcher_rel} (cwd=#{Dir.pwd})")
+      return
+    end
+
+    # Resolve to an absolute path so spawning is independent of the game's
+    # CWD.  The mod-manager update changed how subprocesses inherit CWD on
+    # some setups, so we no longer trust the relative path through `start`.
+    launcher_abs = File.expand_path(launcher_rel)
+    log("  fish-speech autostart: spawning #{launcher_abs}")
+
+    # When debugging, set POKEDEX_VO_DEBUG_SPAWN=1 in the environment to
+    # leave the terminal window visible (no /MIN) so any python.exe / setup
+    # errors are readable.  Default: minimised so the window stays out of
+    # the way during normal play.
+    debug_spawn = ENV["POKEDEX_VO_DEBUG_SPAWN"].to_s == "1"
+
+    begin
+      # Pass --parent-pid so the server's parent-monitor thread will notice
+      # when this Ruby process (the game) exits and shut itself down.
+      # This is the primary shutdown path when at_exit doesn't fire (e.g.
+      # MKXP-Z force-closes on Windows without triggering Ruby's at_exit).
+      parent_pid_arg = "--parent-pid #{Process.pid}"
+      ok = nil
+      if win
+        # Backslashes for the cmd parser.  The path is double-quoted so
+        # spaces/parens/apostrophes in
+        #   C:\Program Files (x86)\Steam\steamapps\common\Kuray's Infinite Fusion (KIF)\
+        # don't break tokenisation.  `start "FishSpeechTTS"` consumes the
+        # title slot so the second quoted argument is correctly treated as
+        # the program to launch (this is the cmd start quirk that bit us
+        # before — without an explicit title, start would use the bat path
+        # itself as the title and then have no program to launch).
+        launcher_win = launcher_abs.gsub('/', '\\')
+        min_flag = debug_spawn ? "" : "/MIN "
+        spawn_cmd = %Q{start "FishSpeechTTS" #{min_flag}"#{launcher_win}" #{parent_pid_arg}}
+        log("  fish-speech autostart: cmdline => #{spawn_cmd}")
+        ok = system(spawn_cmd)
+      else
+        # macOS/Linux: nohup + & detaches.  Redirect to the server's own log.
+        spawn_cmd = %Q{nohup bash "#{launcher_abs}" #{parent_pid_arg} >/dev/null 2>&1 &}
+        log("  fish-speech autostart: cmdline => #{spawn_cmd}")
+        ok = system(spawn_cmd)
+      end
+      log("  fish-speech autostart: system() => #{ok.inspect} ($? = #{$?.inspect rescue 'n/a'})")
+      if ok.nil? || ok == false
+        log("  fish-speech autostart: spawn FAILED — open the launcher manually:")
+        log("    #{launcher_abs}")
+      end
+    rescue => e
+      log("  fish-speech autostart: spawn raised: #{e.class}: #{e.message}")
     end
   end
 
@@ -1182,6 +1612,32 @@ module PokedexVoiceOver
           end
         end
 
+        # Step 2.4: Fish-Speech sidecar - primary on-the-fly TTS backend.
+        # Voice-clones the displayed text via the open-source fish-speech
+        # engine running as a local HTTP server.  Tried BEFORE Piper because
+        # the cloned voice is much closer to the Pokedex narrator.  Falls
+        # through silently when the sidecar is not running or disabled.
+        if playback_mode == :none && fish_speech_enabled?
+          if displayed_text && !displayed_text.strip.empty?
+            unless fish_speech_available?
+              # Server not up - try to auto-launch in the background.  This
+              # request will fall through to Piper; subsequent requests will
+              # find the server alive once it finishes loading (~10-30s).
+              _fish_speech_try_autostart
+            end
+            if fish_speech_available?
+              # Queue TTS asynchronously — generation runs in the background
+              # thread so the entry screen isn't frozen during synthesis.
+              log("  Step 2.4: Fish-Speech available — queuing async TTS (#{displayed_text.length} chars)")
+              playback_mode = :fish_speech_async
+            else
+              log("  Step 2.4: Fish-Speech sidecar unavailable - falling through to Piper")
+            end
+          else
+            log("  Step 2.4: skipping Fish-Speech - no displayed text available")
+          end
+        end
+
         # Step 2.5: Piper TTS fallback — generate audio on-the-fly from the
         # displayed text.  Sits between the pre-recorded fusion audio check
         # (step 2) and the sequential base-species fallback (step 3) so the
@@ -1237,20 +1693,57 @@ module PokedexVoiceOver
       else
         bare = "#{AUDIO_SUBDIR}/dex_#{base}"
 
-        # Check for the primary file and any variants
-        variants = _find_variants(bare)
-        if variants.empty?
-          log("  No audio file found — skipping")
-          return
+        # Step A: Fish-Speech for non-fusion entries.  When the user has the
+        # sidecar running we prefer cloned-voice TTS over pre-recorded files
+        # too - this is what makes the mod work without ANY pre-generated
+        # audio files for regular Pokemon (custom or auto-generated entries
+        # included).  Pre-recorded audio still wins when Fish-Speech is off
+        # or unavailable.
+        if fish_speech_enabled? && displayed_text && !displayed_text.strip.empty?
+          unless fish_speech_available?
+            _fish_speech_try_autostart
+          end
+          if fish_speech_available?
+            # Queue TTS asynchronously — generation happens in the background
+            # thread in parallel with the Pokémon cry, so the entry screen
+            # is never blocked waiting for audio to generate.
+            log("  [regular] Fish-Speech available — queuing async TTS (#{displayed_text.length} chars)")
+            playback_mode = :fish_speech_async
+          end
         end
 
-        matched = _match_variant(variants, displayed_text)
-        if matched.nil? && variants.length > 1 && entry_map.empty?
-          log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing — cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+        # Step B: pre-recorded variants (legacy path - still used when
+        # Fish-Speech is disabled, unavailable, or returned an error).
+        if playback_mode == :none
+          variants = _find_variants(bare)
+
+          if variants.empty?
+            # Step C: Piper TTS last-resort for regular Pokemon when no
+            # pre-recorded audio exists either.
+            if piper_available? && tts_enabled? && displayed_text && !displayed_text.strip.empty?
+              log("  [regular] No pre-recorded audio; attempting Piper TTS (#{displayed_text.length} chars)")
+              tts_bare = _generate_tts(displayed_text)
+              if tts_bare
+                chosen_file = tts_bare
+                playback_mode = :single
+                log("  Playing Piper TTS audio: #{chosen_file}")
+              end
+            end
+
+            if playback_mode == :none
+              log("  No audio file found - skipping")
+              return
+            end
+          else
+            matched = _match_variant(variants, displayed_text)
+            if matched.nil? && variants.length > 1 && entry_map.empty?
+              log("  WARNING: Multiple audio variants found but dex_entry_map.json is missing - cannot match displayed text to correct variant. Run tools/generate_voices.py to generate the entry map. Falling back to random selection.")
+            end
+            chosen_file = matched || variants.sample
+            playback_mode = :single
+            log("  Playing species audio: #{chosen_file} (from #{variants.length} variant(s), matched=#{!matched.nil?})")
+          end
         end
-        chosen_file = matched || variants.sample
-        playback_mode = :single
-        log("  Playing species audio: #{chosen_file} (from #{variants.length} variant(s), matched=#{!matched.nil?})")
       end
     rescue StandardError => e
       log("  File resolution error: #{e.class}: #{e.message}")
@@ -1258,6 +1751,8 @@ module PokedexVoiceOver
     end
 
     return if playback_mode == :none
+    # :fish_speech_async — we don't have a file yet; duration is computed
+    # inside the background thread after TTS completes.
 
     # ------------------------------------------------------------------
     # Compute voiceover duration on the MAIN THREAD (needs file I/O for
@@ -1296,34 +1791,166 @@ module PokedexVoiceOver
     end
 
     # ------------------------------------------------------------------
-    # Background thread: only handles the CRY_DELAY sleep and the actual
-    # Audio.se_play / _play_bare calls — no file I/O or `require` here.
+    # Background thread — handles TTS generation (async), cry delay, and
+    # Audio.se_play.  When playback_mode is :fish_speech_async the HTTP
+    # call to the TTS server runs in a nested thread so the cry delay and
+    # TTS synthesis happen in parallel rather than sequentially.
     # ------------------------------------------------------------------
+    tts_text_snap = displayed_text  # freeze for the closure
+    # Pre-split sentences so the streaming path can generate them one at a time.
+    # A single-sentence entry or non-async mode skips straight to the simple path.
+    tts_sentences_snap = (playback_mode == :fish_speech_async) ?
+                          PokedexVoiceOver._split_sentences(tts_text_snap) : nil
     begin
       Thread.new do
         begin
-          # Wait for the Pokémon's cry to finish before reading the entry.
-          _interruptible_sleep(CRY_DELAY, my_gen)
-          next if @playback_gen != my_gen
+          if playback_mode == :fish_speech_async && tts_sentences_snap && tts_sentences_snap.length > 1
+            # ---------------------------------------------------------------
+            # SENTENCE STREAMING MODE
+            # Generate sentence[0] in parallel with the cry delay, play it as
+            # soon as it is ready, then generate sentence[1] while sentence[0]
+            # is playing, and so on.  The perceived wait drops from "full entry
+            # generation time" to "first sentence generation time" (~40-60% of
+            # the original wait for a typical 2-3 sentence entry).
+            # ---------------------------------------------------------------
+            sentences  = tts_sentences_snap
+            s_results  = Array.new(sentences.length) { nil }
 
-          # Mute BGM for the duration of the voice-over playback
-          save_and_mute_bgm_for_voiceover
+            PokedexVoiceOver.log("  Streaming TTS: #{sentences.length} sentences (#{tts_text_snap.length} chars total)")
 
-          case playback_mode
-          when :single
-            _play_bare(chosen_file)
-          when :sequential
-            _play_bare(seq_head)
-            _interruptible_sleep(seq_head_dur, my_gen)
-            if @playback_gen == my_gen
-              _play_bare(seq_body)
+            # Kick off sentence[0] synthesis immediately — runs in parallel
+            # with the cry delay so the player experiences zero additional wait.
+            s0_thread = Thread.new do
+              s_results[0] = PokedexVoiceOver._generate_tts_fish_speech(sentences[0])
             end
-          end
 
-          # Wait for the voice-over to finish, then restore BGM
-          if @vo_bgm_muted && vo_duration
-            _interruptible_sleep(vo_duration, my_gen)
-            restore_bgm_after_voiceover
+            _interruptible_sleep(CRY_DELAY, my_gen)
+            if @playback_gen != my_gen
+              # CRASH FIX: never call Thread#kill on a thread that may be
+              # mid-HTTP-read.  MRI's docs flag kill as unsafe, and inside
+              # MKXP-Z's embedded interpreter killing a TCPSocket-reading
+              # thread is a known segfault trigger (= "hard crash to desktop"
+              # when the user opens the Pokedex while a request is in flight).
+              # The orphaned thread will finish its synthesis on its own and
+              # the resulting WAV will be ready in the cache next visit.
+              PokedexVoiceOver.log("  Streaming TTS: playback gen changed — orphaning sentence 0 thread")
+              next
+            end
+
+            s0_thread.join
+            if s_results[0].nil?
+              PokedexVoiceOver.log("  Streaming TTS: sentence 0 failed — aborting")
+              next
+            end
+
+            save_and_mute_bgm_for_voiceover
+
+            sentences.each_with_index do |_sentence, i|
+              break if @playback_gen != my_gen
+
+              bare = s_results[i]
+              break unless bare  # this sentence failed to generate
+
+              # Launch synthesis of the NEXT sentence in parallel with playing
+              # the CURRENT one — by the time the current sentence finishes
+              # playing, the next one is already generated (or nearly so).
+              next_thread = nil
+              if i + 1 < sentences.length
+                next_i   = i + 1
+                next_txt = sentences[next_i]
+                next_thread = Thread.new do
+                  s_results[next_i] = PokedexVoiceOver._generate_tts_fish_speech(next_txt)
+                end
+              end
+
+              # Play this sentence and wait for it to finish.
+              _play_bare(bare)
+              wav_abs = "Audio/SE/#{bare}.wav"
+              dur = FileTest.exist?(wav_abs) ?
+                      PokedexVoiceOver._tts_audio_duration(wav_abs) :
+                      PokedexVoiceOver::SEQUENTIAL_DURATION_FALLBACK
+              PokedexVoiceOver.log("  Streaming TTS: sentence #{i + 1}/#{sentences.length} playing (#{dur.round(2)}s)")
+
+              _interruptible_sleep(dur, my_gen)
+
+              if @playback_gen != my_gen
+                # See the comment on the s0_thread orphan path above —
+                # Thread#kill on a TCPSocket-reading thread crashes MKXP-Z.
+                PokedexVoiceOver.log("  Streaming TTS: playback gen changed mid-stream — orphaning prefetch thread")
+                break
+              end
+
+              next_thread&.join
+            end
+
+            restore_bgm_after_voiceover if @vo_bgm_muted
+
+          else
+            # ---------------------------------------------------------------
+            # SINGLE-TEXT / SEQUENTIAL MODE (original logic)
+            # Used for: single-sentence entries, non-fish-speech modes,
+            # sequential base-species fallback.
+            # ---------------------------------------------------------------
+            tts_inner   = nil
+            tts_result  = [nil]   # [file_path]
+            if playback_mode == :fish_speech_async
+              tts_result_ref = tts_result
+              tts_inner = Thread.new do
+                tts_result_ref[0] = PokedexVoiceOver._generate_tts_fish_speech(tts_text_snap)
+              end
+            end
+
+            # Wait for the Pokémon's cry to finish before reading the entry.
+            _interruptible_sleep(CRY_DELAY, my_gen)
+
+            if @playback_gen != my_gen
+              # See streaming-mode comment — Thread#kill on a socket-reading
+              # thread is unsafe in MKXP-Z (segfault).  Let it finish in the
+              # background; its cache write is harmless.
+              PokedexVoiceOver.log("  Single-mode Fish-Speech: playback gen changed — orphaning TTS thread")
+              next
+            end
+
+            # Resolve async TTS result (join nested thread, update local vars).
+            if playback_mode == :fish_speech_async
+              tts_inner.join
+              fs_bare = tts_result[0]
+              if fs_bare
+                chosen_file   = fs_bare
+                playback_mode = :single
+                log("  Async Fish-Speech TTS ready: #{chosen_file}")
+                # Calculate voice-over duration now that the WAV exists.
+                if mute_during_voiceover? && vo_duration.nil?
+                  wav_abs = "Audio/SE/#{chosen_file}.wav"
+                  vo_duration = FileTest.exist?(wav_abs) ? _tts_audio_duration(wav_abs) : SEQUENTIAL_DURATION_FALLBACK
+                end
+              else
+                log("  Async Fish-Speech TTS failed — no audio for this entry")
+                next
+              end
+            end
+
+            next if @playback_gen != my_gen
+
+            # Mute BGM for the duration of the voice-over playback
+            save_and_mute_bgm_for_voiceover
+
+            case playback_mode
+            when :single
+              _play_bare(chosen_file)
+            when :sequential
+              _play_bare(seq_head)
+              _interruptible_sleep(seq_head_dur, my_gen)
+              if @playback_gen == my_gen
+                _play_bare(seq_body)
+              end
+            end
+
+            # Wait for the voice-over to finish, then restore BGM
+            if @vo_bgm_muted && vo_duration
+              _interruptible_sleep(vo_duration, my_gen)
+              restore_bgm_after_voiceover
+            end
           end
         rescue StandardError => e
           PokedexVoiceOver.log("  Playback thread error: #{e.class}: #{e.message}")
@@ -1557,6 +2184,15 @@ end
 # - Species detection now also checks @dexlist[@index] (common Essentials
 #   pattern) as a fallback when @species is not set.
 # =============================================================================
+
+# Pre-load socket on the main thread so background threads can use TCPSocket
+# freely.  In MKXP-Z, calling `require` from a background thread can deadlock;
+# requiring it here (before any Thread.new) avoids that entirely.
+begin
+  require "socket"
+rescue Exception
+  # If socket truly isn't available the TCP helpers will fail gracefully.
+end
 
 PokedexVoiceOver.log("=" * 60)
 PokedexVoiceOver.log("Pokédex Voice Over mod loading...")
@@ -2467,6 +3103,80 @@ end
 PokedexVoiceOver.log("Mod loading finished")
 PokedexVoiceOver.log("=" * 60)
 
+# ---------------------------------------------------------------------------
+# Auto-start the Fish-Speech server at game launch
+# ---------------------------------------------------------------------------
+# If the user has both fish_speech_enabled and fish_speech_autostart set,
+# kick off the server now — in a background thread so the title screen is
+# never delayed.  This gives the ~15-40 s warmup time to complete before the
+# player ever opens a Pokédex entry, so the first read-out is fast.
+#
+# Works on first-ever launch (no manual server start required) because we
+# fire here unconditionally as long as the settings allow it.
+# ---------------------------------------------------------------------------
+if PokedexVoiceOver.fish_speech_enabled?
+  Thread.new do
+    begin
+      # Small delay so the title screen is fully up before we spawn the window
+      sleep(1)
+      PokedexVoiceOver._fish_speech_try_autostart
+      PokedexVoiceOver.log("Game-launch auto-start: server spawn attempted")
+    rescue => e
+      PokedexVoiceOver.log("Game-launch auto-start error: #{e.class}: #{e.message}")
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Game-close: shut down the Fish-Speech sidecar so its terminal window goes
+# away with the game.  Three layers of defence:
+#
+#   1. at_exit — fires on a normal exit (player closes the window from the
+#      title screen, ALT-F4, etc.)  Sends POST /shutdown to the server.
+#   2. trap("INT"/"TERM") — handles Ctrl+C or SIGTERM-style shutdowns.
+#   3. PID-file termination — a fallback path that taskkill /T's the cmd.exe
+#      wrapper window when HTTP shutdown alone isn't enough.
+#
+# An idle-shutdown watchdog inside server.py covers the case where the game
+# crashes and none of the above run.
+# ---------------------------------------------------------------------------
+begin
+  at_exit do
+    begin
+      PokedexVoiceOver._fish_speech_shutdown
+    rescue => e
+      begin
+        PokedexVoiceOver.log("at_exit shutdown error: #{e.class}: #{e.message}")
+      rescue
+        # logging itself failed — nothing else we can do
+      end
+    end
+  end
+rescue => _e
+  # at_exit isn't available in some embedded Ruby builds — silently ignore.
+end
+
+# Convert Ctrl+C / SIGTERM into a clean server shutdown too.  MKXP-Z on Windows
+# does not deliver real POSIX signals so this is mostly a no-op there, but it
+# costs nothing to wire up and helps on Linux/macOS.
+%w[INT TERM].each do |sig|
+  begin
+    Signal.trap(sig) do
+      begin
+        PokedexVoiceOver._fish_speech_shutdown
+      rescue
+        # nothing useful to do from inside a signal handler
+      end
+      # Re-raise so the normal exit path still runs.
+      exit
+    end
+  rescue ArgumentError
+    # Signal not supported on this platform (e.g. SIGTERM on Windows) — skip.
+  rescue => _e
+    # Some embedded Rubies disallow re-trapping; ignore.
+  end
+end
+
 # =============================================================================
 # Mod Settings submenu scene (Stonewall's Mod Settings mod)
 # =============================================================================
@@ -2529,6 +3239,22 @@ class PokedexVoiceOverSettingsScene < PokemonOption_Scene
       proc { ModSettingsMenu.get(:pokedex_vo_replay_on_page_change) || 0 },
       proc { |value| ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, value) },
       _INTL("Replay the voice-over when navigating back to the description page")
+    )
+
+    options << EnumOption.new(
+      _INTL("Fish-Speech Voice (Primary)"),
+      [_INTL("Off"), _INTL("On")],
+      proc { v = ModSettingsMenu.get(:pokedex_vo_fish_speech_enabled); v.nil? ? 1 : v },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_fish_speech_enabled, value) },
+      _INTL("Use the offline Fish-Speech sidecar as the primary voice for every entry (requires fish_speech/setup.py to have been run)")
+    )
+
+    options << EnumOption.new(
+      _INTL("Auto-Start Fish-Speech Server"),
+      [_INTL("Off"), _INTL("On")],
+      proc { v = ModSettingsMenu.get(:pokedex_vo_fish_speech_autostart); v.nil? ? 1 : v },
+      proc { |value| ModSettingsMenu.set(:pokedex_vo_fish_speech_autostart, value) },
+      _INTL("Auto-launch the Fish-Speech server when the game starts so it is ready before you open the Pokedex")
     )
 
     options << EnumOption.new(
@@ -2596,6 +3322,8 @@ pokedex_vo_register_settings = proc {
   ModSettingsMenu.set(:pokedex_vo_mute_music, 1) if ModSettingsMenu.get(:pokedex_vo_mute_music).nil?
   ModSettingsMenu.set(:pokedex_vo_mute_during_voiceover, 1) if ModSettingsMenu.get(:pokedex_vo_mute_during_voiceover).nil?
   ModSettingsMenu.set(:pokedex_vo_replay_on_page_change, 0) if ModSettingsMenu.get(:pokedex_vo_replay_on_page_change).nil?
+  ModSettingsMenu.set(:pokedex_vo_fish_speech_enabled, 1) if ModSettingsMenu.get(:pokedex_vo_fish_speech_enabled).nil?
+  ModSettingsMenu.set(:pokedex_vo_fish_speech_autostart, 1) if ModSettingsMenu.get(:pokedex_vo_fish_speech_autostart).nil?
   ModSettingsMenu.set(:pokedex_vo_tts_enabled, 1) if ModSettingsMenu.get(:pokedex_vo_tts_enabled).nil?
 
   ModSettingsMenu.register(:pokedex_vo_submenu, {
@@ -2614,7 +3342,8 @@ pokedex_vo_register_settings = proc {
       "voice over", "pokedex", "volume", "mute music", "narration",
       "dexter", "voice", "audio", "re-read", "page change",
       "capture", "mute during voiceover", "tts", "piper", "text to speech",
-      "tts fallback", "auto-generated"
+      "tts fallback", "auto-generated", "fish-speech", "fish speech",
+      "voice clone", "auto-start"
     ]
   })
 }

@@ -1,45 +1,118 @@
 # KIF Pokédex Voice Over
 
-A mod for **Kuray's Infinite Fusion (KIF)** that reads every Pokédex entry
-aloud in the style of **Dexter** — the classic robotic Pokédex narrator from
-the original Pokémon anime — whenever you open a Pokémon's Pokédex entry,
-including every fused variant.
+A mod for [Kuray's Infinite Fusion (KIF)](https://github.com/kurayamiblackheart/kurayshinyrevamp)
+that reads every Pokédex entry aloud in the style of **Dexter**, the classic
+robotic narrator from the original Pokémon anime — for every base Pokémon,
+every custom dex entry, and every auto-generated fusion (head × body) the
+game can produce.
+
+The mod ships an offline voice-clone sidecar built on the open-source
+[fish-speech](https://github.com/fishaudio/fish-speech) engine — the same
+engine that powers the Fish Audio
+[Pokédex Voice Over model](https://fish.audio/m/57a07a0af0954230a44d1db3adc77940/).
+After a one-time first-launch install everything runs **fully offline**, with
+**no API keys** and **no network calls at play time**.
+
+---
+
+## Install (plug-and-play, zero prerequisites)
+
+1. **Download** the mod ZIP from the
+   [Releases page](https://github.com/SilvertongueRED/KIF-Pokedex-Voice-Over/releases)
+   (or via KIF's in-game Mod Browser once it's listed at
+   [KIF-Mods/mods](https://github.com/KIF-Mods/mods)).
+2. **Extract** so the `pokedex_voice_over/` folder lives in your KIF game's
+   `Mods/` directory:
+
+   ```
+   <KIF game root>/
+   └── Mods/
+       └── pokedex_voice_over/
+           ├── mod.json
+           ├── main.rb
+           └── fish_speech/   ← the offline TTS sidecar
+   ```
+
+3. **Launch KIF and open any Pokédex entry.** That's it.
+
+That's the entire procedure — there is nothing else to install by hand.
+The first time you open the Pokédex, the mod auto-spawns the Fish-Speech
+sidecar in a minimised terminal window, which performs a complete one-time
+first-run setup in this order:
+
+* **Python** — Windows uses a **bundled portable Python 3.12** that lives
+  entirely inside `fish_speech/python/`. The launcher extracts it from the
+  official python.org embeddable ZIP — **no installer EXE, no SmartScreen
+  prompt, no admin, no PATH changes, no registry edits**. Uninstall is just
+  "delete the mod folder." macOS uses Homebrew; Linux uses your distro's
+  package manager.
+* **PyTorch** — installs the matching CPU or CUDA wheel (auto-detected).
+* **Engine dependencies** — installs the small set of inference-only Python
+  packages the engine needs, listed in `fish_speech/requirements-runtime.txt`.
+  The Fish-Speech **engine itself is bundled with the mod** (vendored under
+  `fish_speech/vendor/` — see *Offline & self-contained design* below), so
+  setup never clones or downloads it from GitHub.
+* **Model weights** — downloads the ~1.4 GB voice-clone model from the
+  public [`fishaudio/fish-speech-1.5`](https://huggingface.co/fishaudio/fish-speech-1.5)
+  Hugging Face repo. No token, no account, no API key required.
+
+The first entry on first launch may stay silent while this runs; from the
+second entry onward the voice plays normally. Every subsequent game launch
+skips straight to the server — usually a 5–15 second warm-up.
+
+If you'd rather pre-warm the install so the first entry isn't silent, run
+the launcher once before opening the game:
+
+* Windows: double-click `Mods/pokedex_voice_over/fish_speech/Start_TTS_Server.bat`
+* macOS / Linux: `./Mods/pokedex_voice_over/fish_speech/start_tts_server.sh`
+
+Leave the terminal open. When the game closes, the mod closes it for you.
 
 ---
 
 ## Features
 
-- 🔊 Reads the full Pokédex description text aloud the moment you open any
-  entry
-- 🧬 Works for **all fused Pokémon** combinations (head × body) when
-  fusion-specific audio files are available
-- 🔀 **Accurate entry variant matching** — fusions with multiple possible
-  Pokédex descriptions get separate audio files; the mod matches the
-  currently displayed text to the correct audio variant using a multi-strategy
-  matching system (exact, prefix, substring, word-overlap, and fuzzy LCS
-  fallback)
-- 📝 **POKENAME placeholder resolution** — dex entries containing the
-  literal `POKENAME` placeholder are automatically resolved to the actual
-  fusion species names in both TTS audio generation and runtime matching
-- 🔄 **Scrolling navigation playback** — voice automatically plays when
-  scrolling through Pokédex entries with the D-pad/arrow keys, not just when
-  opening an entry
-- 🎵 **Music pauses while the Pokédex is open** — background music fades out
-  when you enter the Pokédex and resumes when you exit, not just during
-  voice playback
-- ⚙️ In-game settings submenu (volume, enable/disable, mute music, re-read
-  on page return) via Stonewall's **Mod Settings** under Interface
-- 🔇 Silently skips entries that have no audio file — safe to install before
-  generating audio
-- 🗣️ **Piper TTS fallback** — when no pre-recorded audio matches an
-  auto-generated fusion entry, the mod can generate speech on-the-fly using
-  [Piper](https://github.com/rhasspy/piper), a lightweight offline neural TTS
-  engine; generated audio is cached so repeat visits play instantly
-- 🛑 Automatically stops the voice when you close the Pokédex
-- 🪝 **Text capture hooks** — hooks KIF's `drawEntryText`,
-  `getCustomEntryText`, `getCustomDexEntry`, and `getAIDexEntry` methods to
-  capture the exact text KIF generates, ensuring the correct audio variant is
-  always played
+* 🔊 Reads the full Pokédex description aloud the moment you open any entry.
+* 🧬 Works for **every fused Pokémon** combination — head × body — including
+  auto-generated AI fusion entries.
+* 🚀 **Zero-prerequisite install.** No Python install, no pip commands, no
+  manual model download — the first launch auto-installs everything per-user
+  without an admin prompt.
+* 🐟 **Fish-Speech voice cloning (offline, primary)** — clones the Pokédex
+  narrator reference clip and reads any entry on the fly. No pre-generated
+  audio files needed.
+* 🗣️ **Piper TTS fallback** — if you'd rather not use the heavier
+  Fish-Speech stack, drop a [Piper](https://github.com/rhasspy/piper) voice
+  into `Mods/pokedex_voice_over/piper/` and the mod will use that instead.
+* ⚡ **Cached output** — generated WAVs are cached by content hash in
+  `Audio/SE/Pokedex/tts_cache/` so repeat visits play instantly.
+* 🎵 **Music fades** while the Pokédex is open and resumes when you exit.
+* 🔄 **Scroll-aware playback** — voice plays as you scroll through entries
+  with the D-pad / arrow keys, not just when you open one.
+* ⚙️ In-game settings (volume, enable/disable, mute music, re-read on page
+  return, prefer Fish-Speech, prefer Piper) via the KIF Mod Manager and
+  Stonewall's Mod Settings.
+* 🔐 **No personal API keys.** The model comes from a public Hugging Face
+  repo; no Fish Audio / FakeYou login is required.
+
+---
+
+## In-game settings
+
+Settings are exposed both through **KIF's Mod Manager** (Title Screen → Mod
+Manager → Installed Mods → Pokédex Voice Over → Settings) and through
+**Stonewall's Mod Settings** if you have it installed (Options → Mod
+Settings → Interface → Pokédex Voice Over).
+
+| Setting | Default | Description |
+|---|---|---|
+| Enable Voice Over | On | Master on/off switch. |
+| Voice Volume | 80 | Playback volume (0–100). |
+| Mute Music in Pokédex | On | Fade background music while the Pokédex is open. |
+| Re-read on Page Return | Off | Re-play the voice when navigating back to the description page. |
+| Fish-Speech Voice (Primary) | On | Use the offline voice-clone server as the primary voice. |
+| Auto-Start Fish-Speech Server | On | Let the mod spawn the sidecar on demand instead of requiring a manual launch. |
+| TTS Fallback (Piper) | On | Use Piper if Fish-Speech is unavailable. |
 
 ---
 
@@ -47,462 +120,71 @@ including every fused variant.
 
 | Requirement | Notes |
 |---|---|
-| **Kuray's Infinite Fusion (KIF)** | The Kuray fork with Mod Manager support |
-| **Python 3.8+** | For the audio-generation script only; Python 3.13+ is fully supported via `audioop-lts` (installed automatically by `pip install -r tools/requirements.txt`) |
-| **ffmpeg** | Required by pydub to export OGG files — [download here](https://ffmpeg.org/download.html) |
-| **Internet access** | Required for the recommended `--backend fakeyou` (the real anime Pokédex voice) |
+| **Kuray's Infinite Fusion** | The Kuray fork with Mod Manager support (v0.9.4+). |
+| **Windows / macOS / Linux** | Anything that runs KIF works. Windows uses a bundled portable Python; macOS/Linux install Python via Homebrew or your distro. |
+| **~3 GB disk** | ~1.4 GB for the model weights + ~1.5 GB for the PyTorch wheels. Both go in the mod folder, deletable any time. |
+| **GPU (optional)** | CUDA NVIDIA GPU gets you ~0.5 s per entry. A modern CPU gets you ~3–8 s; the Pokémon cry masks most of that. |
+| **Internet (one time)** | Only needed during first-launch setup (python.org + PyPI + Hugging Face). After that everything runs offline. |
 
 ---
 
-## Installation
+## How it works
 
-### Step 1 — Install the mod
+The mod is a single Ruby script (`main.rb`) that hooks KIF's Pokédex scene
+to capture the exact text being displayed (including auto-generated fusion
+entries containing the literal `POKENAME` placeholder, which it resolves to
+the actual fused name). It then calls a tiny local HTTP server in
+`fish_speech/` (`POST 127.0.0.1:7861/tts`) and plays the returned WAV
+through RPGMaker's audio system.
 
-Copy the `Mods/pokedex_voice_over/` folder into your KIF game's `Mods/`
-directory:
+The server is `fish_speech/server.py` — a thin wrapper around the
+[fish-speech](https://github.com/fishaudio/fish-speech) **1.5** engine, which
+is **vendored into the mod** at `fish_speech/vendor/` and added to Python's
+import path at startup. It keeps the model loaded between requests so per-entry
+latency is sub-second on GPU. The model and its tokenizer are downloaded once
+from the public
+[`fishaudio/fish-speech-1.5`](https://huggingface.co/fishaudio/fish-speech-1.5)
+Hugging Face repo — no token, no account, no API key required.
 
-```
-<KIF game root>/
-└── Mods/
-    └── pokedex_voice_over/
-        ├── mod.json
-        └── main.rb
-```
-
-Alternatively, install it through the in-game **Mod Browser** once the mod
-has been published to the KIF-Mods repository.
-
-### Step 2 — Generate audio files
-
-The mod does **not** bundle pre-generated audio (the files would be hundreds
-of megabytes).  You generate them yourself from your own game data using the
-included Python script.
-
-#### 2a. Install Python dependencies
-
-```bash
-cd tools/
-pip install -r requirements.txt
-```
-
-#### 2b. Run the generator
-
-**Recommended: Use FakeYou for the real anime Pokédex voice**
-
-The `--backend fakeyou` option uses the [FakeYou](https://fakeyou.com/) AI
-voice model **"Pokedex (Pokemon, 4Kids)"** — a community-trained model that
-replicates the actual Dexter voice from the original Pokémon anime.  This is
-the same approach used by [adriantwarog/Pokedex-RL](https://github.com/adriantwarog/Pokedex-RL).
-
-```bash
-# Generate all Pokémon entries (regular + fusions) with the real anime voice
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou
-
-# With FakeYou login (auto-obtains session cookie — recommended)
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --fakeyou-username YOUR_USER --fakeyou-password YOUR_PASS
-
-# With FakeYou priority queue access (set FAKEYOU_COOKIE env var or pass directly)
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --fakeyou-cookie YOUR_COOKIE
-
-# Generate for a single Pokémon
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --species BULBASAUR
-
-# Skip fusion entries — generate only regular Pokémon
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --no-fusions
-
-# Overwrite any existing files
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --overwrite
-
-# Retry only entries that failed in a previous run
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --retry-failed
-
-# Re-generate only entries that had the POKENAME placeholder (resolve to real names)
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename
-```
-
-> **Authenticating with FakeYou (recommended for faster generation):**
->
-> **Option A — Login directly (easiest):** Pass `--fakeyou-username` and
-> `--fakeyou-password` on the command line.  The script will log in
-> automatically and use the session for priority queue access.  You can
-> also use `FAKEYOU_USERNAME` and `FAKEYOU_PASSWORD` environment variables.
->
-> **Option B — Session cookie:** Create a free account at
-> [fakeyou.com](https://fakeyou.com/), log in, then copy the `session`
-> cookie value from your browser's developer tools (Application → Cookies
-> → fakeyou.com → `session`).  Pass it via `--fakeyou-cookie` or the
-> `FAKEYOU_COOKIE` environment variable.
-
-**Alternative: Offline/generic TTS backends**
-
-If you prefer offline generation or do not have internet access, the
-`pyttsx3` and `gTTS` backends are available as fallbacks.  These use generic
-system voices with post-processing effects to approximate the Pokédex sound,
-but they will not match the real anime voice.
-
-```bash
-# Use offline system TTS (pyttsx3 — generic voice with effects)
-python tools/generate_voices.py --game-dir /path/to/KIF
-
-# Use Google TTS (gTTS — generic voice with effects)
-python tools/generate_voices.py --game-dir /path/to/KIF --backend gtts
-
-# List available pyttsx3 voices (to pick one)
-python tools/generate_voices.py --list-voices
-python tools/generate_voices.py --game-dir /path/to/KIF --voice 1
-```
-
-The script will save `.ogg` files and metadata to:
-
-```
-<KIF game root>/Audio/SE/Pokedex/
-```
-
-In addition to the audio files, the script generates two metadata files:
-
-| File | Purpose |
-|---|---|
-| `dex_durations.json` | Duration (in seconds) of each audio file — used for sequential playback timing |
-| `dex_entry_map.json` | Maps each audio filename to the Pokédex entry text it was generated from — used by the mod to match the correct audio variant to the currently displayed text |
-
-Audio files are named after the Pokémon's internal species name:
-
-| File | Pokémon |
-|---|---|
-| `dex_BULBASAUR.ogg` | Bulbasaur |
-| `dex_CHARMANDER.ogg` | Charmander |
-| `dex_BULBASAUR_CHARMANDER.ogg` | Bulbasaur/Charmander fusion (primary entry) |
-| `dex_BULBASAUR_CHARMANDER_v2.ogg` | Bulbasaur/Charmander fusion (variant entry 2) |
-| `dex_BULBASAUR_CHARMANDER_v3.ogg` | Bulbasaur/Charmander fusion (variant entry 3) |
-
-Variant files (`_v2`, `_v3`, …) are only generated for fusions that have
-multiple different Pokédex descriptions.  The mod uses the `dex_entry_map.json`
-to match the currently displayed text to the correct variant file, rather than
-selecting one at random.
-
-### Step 3 — Launch KIF
-
-Start the game.  The Mod Manager loads the plugin automatically.  Open any
-Pokédex entry and the voice will play.
+If Fish-Speech is unavailable (e.g. the user declined the Python install
+prompt or the GPU OOM'd) the mod falls through to its built-in **Piper**
+path. Piper is the small offline neural TTS used by Home Assistant; drop
+the matching `piper.exe` (or `piper` binary) and a `*.onnx` voice model
+into `Mods/pokedex_voice_over/piper/` and the mod picks it up automatically.
 
 ---
 
-## Mod Settings
+## Offline & self-contained design
 
-If **Stonewall's Mod Settings** is installed, settings are available under
-**Options → Mod Settings → Interface → Pokédex Voice Over** (opens a
-dedicated submenu).
+The Fish-Speech 1.5 engine source is **vendored** inside the mod at
+`fish_speech/vendor/` (a trimmed, pinned copy of the upstream code). `server.py`
+puts that folder first on Python's import path, so the mod always runs the exact
+engine it shipped with — it never `pip install`s fish-speech from GitHub or
+PyPI. First-run setup therefore only installs (a) the right PyTorch wheel and
+(b) the inference-only leaf packages in `fish_speech/requirements-runtime.txt`.
+After that one-time download, nothing reaches the network at play time.
 
-Settings are also accessible from the KIF Mod Manager:
-**Title Screen → Mod Manager → Installed Mods → Pokédex Voice Over →
-Settings**.
-
-| Setting | Default | Description |
-|---|---|---|
-| **Enable Voice Over** | On | Master on/off switch |
-| **Voice Volume** | 80 | Playback volume (0–100) |
-| **Mute Music in Pokédex** | On | Fade out background music while the Pokédex is open |
-| **Re-read on Page Return** | Off | Re-play the voice when navigating back to the description page |
-| **TTS Fallback (Piper)** | On | Use Piper TTS to read auto-generated entries aloud when no pre-recorded audio exists (requires Piper to be installed — see [Piper TTS Fallback](#piper-tts-fallback-auto-generated-entries)) |
-
----
-
-## Where Pokédex Data Comes From
-
-The generator script automatically detects and reads Pokédex data from your
-game installation:
-
-1. **`Data/species.dat`** (KIF — preferred) — The compiled species database
-   that ships with every KIF installation.  Requires the `rubymarshal`
-   Python package (installed automatically by `pip install -r requirements.txt`).
-2. **`PBS/pokemon.txt`** (vanilla PIF fallback) — The plain-text PBS file
-   used by original Pokémon Infinite Fusion builds.  If your installation
-   has a `PBS/` folder, the script will use it when `species.dat` is not
-   available.
-3. **`Data/Scripts/990_NPT/001_Registration.rb`** (supplementary) — Ruby
-   script files that register additional Pokémon via
-   `GameData::Species.register({...})` blocks.  The script auto-discovers
-   these under `Data/Scripts/` and merges any species not already found in
-   `species.dat` or PBS.  Use `--registration-file` to point at a specific
-   file if it lives in a non-standard location.
-
-If none of these files are found, use `--pbs-file` or `--registration-file`
-to point the script at your data manually.
+> **Maintainer note — keep the engine on 1.5.** fish-speech 2.x reorganised the
+> package and removed the firefly VQ-GAN module
+> (`fish_speech.models.vqgan.modules.fsq.DownsampleFiniteScalarQuantize`) that
+> the 1.5 checkpoint instantiates, so a 2.x engine *cannot* load these weights.
+> Don't bump the vendored copy to 2.x without also rewriting `server.py` and
+> swapping the model checkpoint. To refresh the vendored source, copy
+> `fish_speech/` and `tools/` from the upstream `v1.5.0` tag into
+> `fish_speech/vendor/`, keeping the `.project-root` marker and the
+> per-directory `__init__.py` files.
 
 ---
 
-## Fused Pokémon Support
-
-The mod hooks into the same Pokédex scene that displays fused entries.  When
-a fusion's audio file exists, it plays automatically.  If no fusion-specific
-file is found, the mod falls back to silence (it does **not** play the head
-or body species voice instead, to avoid confusing entries).
-
-To generate fusion audio you need KIF builds that store fusion Pokédex
-descriptions.  The script checks multiple sources automatically (fusions are
-generated by default — use `--no-fusions` to skip):
-
-1. **`Data/pokedex/*.json`** (KIF) — All JSON files in the `Data/pokedex/`
-   directory (not just `dex.json`).  The script also scans additional KIF
-   data directories: `Data/dex_entries/`, `Data/custom_dex/`, and
-   `Data/fusion_entries/`.  It handles three JSON formats: record lists,
-   key-value maps, and nested head→body→text dictionaries.
-2. **PBS fusion files** (vanilla PIF fallback) — merged as additional
-   variants when text differs from existing JSON entries:
-
-```
-PBS/fusions.txt
-PBS/fusion_dex.txt
-PBS/fusionmon.txt
-```
-
-### POKENAME Placeholder Resolution
-
-Some fusion dex entries contain the literal `POKENAME` placeholder (e.g.
-*"Whole groups of POKENAME curl up together like vines"*).  KIF's game
-engine replaces this at runtime with the actual fusion name, but the raw
-text files retain the placeholder.
-
-The generator resolves `POKENAME` to the fusion's actual fused name using:
-
-1. **Custom fused names** — loaded from `Data/custom_fused_pokemon_names.tsv`
-   (or `.txt`) in the game directory, where KIF stores player/community-defined
-   fusion names (e.g. *"Bulbasaurizard"* for Bulbasaur + Charmander).
-2. **Portmanteau algorithm** — if no custom name exists, the script generates
-   one algorithmically by taking roughly the first half of the head Pokémon's
-   name and the last half of the body Pokémon's name (e.g. *"Bulbander"* for
-   Bulbasaur + Charmander, *"Pikasaur"* for Pikachu + Bulbasaur).
-
-The resolved text is stored in `dex_entry_map.json` for accurate variant
-matching at runtime.
-
-If you've already generated audio and want to fix only the POKENAME entries:
-
-```bash
-python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename
-```
-
-This selectively regenerates only the entries that contained `POKENAME`,
-without re-converting all your existing audio files.
-
----
-
-## How the Voice Generation Works
-
-### FakeYou backend (recommended — `--backend fakeyou`)
-
-The generator uses the [FakeYou](https://fakeyou.com/) text-to-speech API
-with the community-trained **"Pokedex (Pokemon, 4Kids)"** AI voice model.
-This model was trained on actual Pokédex Dexter voice clips from the 4Kids
-English dub of the Pokémon anime, producing audio that sounds like the real
-thing.  This is the same voice model used by the
-[real-life Pokédex project](https://github.com/adriantwarog/Pokedex-RL).
-
-No post-processing effects are applied — the AI voice model produces the
-authentic Pokédex sound directly.
-
-### pyttsx3 / gTTS backends (offline fallbacks)
-
-When using the generic `pyttsx3` or `gTTS` backends, the generator applies
-three post-processing steps to approximate the Pokédex sound:
-
-1. **High-pass filter (350 Hz)** — removes bass, producing the thin,
-   broadcast-radio quality
-2. **Low-pass filter (4 000 Hz)** — softens harsh sibilance
-3. **Echo overlay (35 ms, −13 dB)** — adds the characteristic robotic
-   resonance
-
-These effects are applied by `pydub`.  If `pydub` is not installed the raw
-TTS audio is saved without effects.
-
----
-
-## Piper TTS Fallback (Auto-Generated Entries)
-
-When a fused Pokémon has no pre-recorded audio, KIF auto-generates the
-Pokédex entry by randomly splicing sentences from both base species' entries.
-This text changes every time you open the entry, so no single pre-recorded
-file can ever match it.
-
-The mod solves this with a **Piper TTS fallback**: a lightweight, offline
-neural text-to-speech engine that reads whatever text is currently on screen.
-It sits between "try pre-recorded fusion audio" and "play both base species
-back-to-back" in the playback chain:
-
-```
-1. Try matched fusion audio (dex_HEAD_BODY.ogg)  →  if found & text matches, play it
-2. Try Piper TTS (NEW)                           →  if installed, generate & play on-the-fly
-3. Fall back to sequential base-species playback (existing behaviour)
-```
-
-### Setting Up Piper TTS
-
-#### Step A — Download Piper
-
-Download the release for your platform from the
-[Piper releases page](https://github.com/rhasspy/piper/releases):
-
-| Platform | File to download |
-|---|---|
-| Windows | `piper_windows_amd64.zip` |
-| Linux (x86-64) | `piper_linux_x86_64.tar.gz` |
-| macOS (Apple Silicon) | `piper_macos_aarch64.tar.gz` |
-| macOS (Intel) | `piper_macos_x86_64.tar.gz` |
-
-Extract the archive and copy the executable into your mod directory:
-
-```
-<KIF game root>/
-└── Mods/
-    └── pokedex_voice_over/
-        └── piper/
-            ├── piper.exe   (Windows) or piper (Linux/macOS)
-            ├── model.onnx
-            └── model.onnx.json
-```
-
-> **Tip:** The mod also searches the system `PATH` for a `piper` executable if
-> you prefer a system-wide installation — just omit the local `piper/` folder.
-
-#### Step B — Obtain a Voice Model
-
-You need a Piper voice model in ONNX format.  There are two options:
-
-**Option 1 — Pre-trained English voice (quick start)**
-
-Download any English voice model from the
-[Piper voices repository](https://huggingface.co/rhasspy/piper-voices/tree/main/en)
-and place `*.onnx` and `*.onnx.json` in `Mods/pokedex_voice_over/piper/`,
-renaming them to `model.onnx` and `model.onnx.json`.  The voice won't sound
-exactly like Dexter, but it will read the entry text clearly.
-
-**Option 2 — Custom Dexter voice (recommended)**
-
-Train a voice model on your existing pre-recorded `dex_*.ogg` files so the
-TTS sounds like the Dexter narrator.  See [Training a Custom Dexter Voice](#training-a-custom-dexter-voice) below.
-
-#### Step C — Enable in Mod Settings
-
-The TTS fallback is **on by default** when Piper is detected.  To toggle it:
-
-**Options → Mod Settings → Interface → Pokédex Voice Over → TTS Fallback (Piper)**
-
-| Setting | Default | Description |
-|---|---|---|
-| **TTS Fallback (Piper)** | On | Use Piper to read entries with no pre-recorded audio |
-
-#### How It Works at Runtime
-
-1. When you open a fused Pokémon entry with no pre-recorded audio, the mod
-   generates a WAV file by piping the displayed text into Piper.
-2. The generated file is cached in `Audio/SE/Pokedex/tts_cache/` with a
-   deterministic filename derived from the text content.
-3. On the next visit to the same entry with the same text, the cached file is
-   played instantly — no generation delay.
-4. Cache files are small (~100–200 KB each) and can be safely deleted at any
-   time.  They are regenerated on demand.
-
-**Generation latency:** approximately 1–2 seconds on a modern CPU for a
-typical two-sentence Pokédex entry.  The Pokémon's cry plays first (during
-the `CRY_DELAY`), so there is no perceptible silent gap.
-
----
-
-## Training a Custom Dexter Voice
-
-You already have an excellent source of training data — your pre-recorded
-`dex_*.ogg` files with matching transcripts in `dex_entry_map.json`.
-
-### Step 1 — Prepare the dataset
-
-```bash
-python tools/train_piper_voice.py --game-root /path/to/KIF
-```
-
-The script:
-
-1. Reads `dex_entry_map.json` for audio-to-text mappings
-2. Scans `Audio/SE/Pokedex/` for matching `.ogg` files
-3. Converts each OGG to a 22 050 Hz mono WAV using ffmpeg
-4. Writes an **LJSpeech-format** dataset to `tools/piper_training_data/`:
-
-```
-tools/piper_training_data/
-├── wavs/
-│   ├── dex_00001.wav
-│   ├── dex_00002.wav
-│   └── ...
-└── metadata.csv   (filename|text|normalized_text)
-```
-
-Options:
-
-```bash
-# Use 16 kHz (required by some Piper base models)
-python tools/train_piper_voice.py --game-root /path/to/KIF --sample-rate 16000
-
-# Include fusion entries (disabled by default — fusion text varies at runtime)
-python tools/train_piper_voice.py --game-root /path/to/KIF --include-fusions
-```
-
-**Requirements:** Python 3.8+, ffmpeg on PATH.
-
-### Step 2 — Train on Google Colab (free GPU)
-
-1. Install the Piper training package:
-
-   ```bash
-   pip install piper-train
-   ```
-
-2. Preprocess the dataset:
-
-   ```bash
-   python -m piper_train.preprocess \
-     --language en-us \
-     --input-dir tools/piper_training_data \
-     --output-dir tools/piper_training_data/preprocessed \
-     --sample-rate 22050
-   ```
-
-3. Open the official Piper training notebook on Google Colab:
-   [piper_train.ipynb](https://github.com/rhasspy/piper/blob/master/notebooks/piper_train.ipynb)
-
-   Upload your `preprocessed/` folder to Colab and follow the notebook
-   instructions.  Training time is typically **4–8 hours** on a free Colab T4
-   GPU for a dataset of ~1 000 utterances.
-
-### Step 3 — Export and install the model
-
-After training, export to ONNX:
-
-```bash
-python -m piper_train.export_onnx \
-  --checkpoint path/to/checkpoint.ckpt \
-  --output model.onnx
-```
-
-Copy the two output files to your mod's piper directory:
-
-```
-Mods/pokedex_voice_over/piper/
-├── model.onnx
-└── model.onnx.json
-```
-
-The mod auto-detects the model on the next game launch.
-
-### Training Data Requirements
-
-| Hours of audio | Expected voice quality |
-|---|---|
-| < 30 min | Intelligible but robotic |
-| 1–2 hours | Good — clearly voice-cloned |
-| 2–4 hours | Excellent — near-indistinguishable |
-| 4+ hours | Best possible quality |
-
-> **Note:** A pre-trained Dexter voice model may be provided in a future
-> release of this mod, eliminating the need to train your own.
+## Uninstalling
+
+Delete the `Mods/pokedex_voice_over/` folder. That's all — the bundled
+Python interpreter, every pip-installed package, the model weights, and the
+caches all live inside that folder, so there's no system cleanup left over.
+
+(On macOS / Linux, Python was installed via Homebrew or your distro's
+package manager and stays installed in case other tools need it; remove
+it via your usual package-manager uninstall flow if you want it gone.)
 
 ---
 
@@ -510,60 +192,27 @@ The mod auto-detects the model on the next game launch.
 
 | Symptom | Fix |
 |---|---|
-| Voice doesn't sound like the anime Pokédex | Use `--backend fakeyou` — the default `pyttsx3`/`gTTS` backends use generic voices with effects. FakeYou uses an AI model trained on the real anime voice. |
-| FakeYou job times out | The anonymous queue can be slow. Use `--fakeyou-username`/`--fakeyou-password` to log in automatically, or pass a session cookie via `--fakeyou-cookie` / `FAKEYOU_COOKIE` env var for priority access. |
-| FakeYou returns "rate limited" | Wait a few minutes and try again. With a FakeYou account you get higher rate limits. For large batches, the script automatically pauses and retries. |
-| FakeYou login/cookie error | Make sure your FakeYou username/password are correct. If passing a cookie manually, you only need the token value — the script handles `session=` prefixes automatically. |
-| `requests` not installed | Run `pip install -r tools/requirements.txt` to install all dependencies including `requests` (needed for `--backend fakeyou`). |
-| No voice plays | Check `Mods/pokedex_voice_over/debug.log` for diagnostics.  Verify `.ogg` files are in `Audio/SE/Pokedex/` (inside your KIF game root).  The log shows whether hooks were installed, what species was detected, and whether the audio file was found. |
-| Wrong audio variant plays for fusions | Ensure `dex_entry_map.json` exists in `Audio/SE/Pokedex/`.  If it's missing, re-run `tools/generate_voices.py` to regenerate it.  The mod logs a warning when multiple variants exist but the entry map is missing. |
-| Fusion audio says "POKENAME" literally | Re-run the generator with `--redo-pokename` to resolve the placeholder to the actual fused name: `python tools/generate_voices.py --game-dir /path/to/KIF --backend fakeyou --redo-pokename` |
-| Some entries failed to generate | Re-run with `--retry-failed` to retry only the failed entries — check `Audio/SE/Pokedex/failed_entries.json` for details |
-| `No Pokédex entries found` | Run `pip install rubymarshal` so the script can read `Data/species.dat` directly.  If your game has a `PBS/` folder instead, it will be used automatically.  If your game stores species in a `Registration.rb` script, use `--registration-file /path/to/001_Registration.rb`. |
-| `ffmpeg not found on PATH` warning | Install ffmpeg and add it to your PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html).  On Windows, open a **new** terminal after updating PATH so the change takes effect. |
-| `pydub processing failed: [WinError 2]` | ffmpeg is not on PATH (or the terminal was opened before ffmpeg was added to PATH).  Install ffmpeg and restart your terminal, then re-run the script. |
-| `pydub` import fails with `ModuleNotFoundError: No module named 'audioop'` (Python 3.13+) | Run `pip install -r tools/requirements.txt` — this installs `audioop-lts` which replaces the `audioop` module removed in Python 3.13. |
-| pyttsx3 voices sound wrong | Try `--voice 1` (or another index shown by `--list-voices`) — or switch to `--backend fakeyou` for the real anime voice |
-| gTTS fails | Check your internet connection |
-| Voice cuts off mid-sentence | Normal for the ME channel — the full file plays but in-game ME events can interrupt it |
-| Mod not loading | Ensure `Mods/pokedex_voice_over/mod.json` and `main.rb` are both present |
-| Game crashes on launch with `require "json"` error | Update to the latest version of the mod.  Older versions used a bare `require "json"` which crashes on KIF's MKXP-EX runtime.  The current version includes a built-in fallback JSON parser that handles this automatically. |
-| Piper TTS is not reading entries | Check `debug.log` for `piper_available? => false`.  Verify `piper.exe` (or `piper`) and `model.onnx` are in `Mods/pokedex_voice_over/piper/`.  Also confirm "TTS Fallback (Piper)" is On in Mod Settings. |
-| Piper TTS reads entries but sounds wrong | The default voice model may not match Dexter's style.  Train a custom voice using `tools/train_piper_voice.py` — see [Training a Custom Dexter Voice](#training-a-custom-dexter-voice). |
-| Piper TTS has a 1–2 second delay before speaking | This is normal for on-the-fly generation.  Once generated, the file is cached and plays instantly on every subsequent visit to that entry. |
-| TTS cache is taking up disk space | Cache files live in `Audio/SE/Pokedex/tts_cache/` — each is ~100–200 KB.  Delete the folder at any time; files are regenerated on demand. |
-| `train_piper_voice.py` fails with "ffmpeg not found" | Install ffmpeg and add it to PATH — see the [ffmpeg download page](https://ffmpeg.org/download.html). |
+| Pokédex entries are silent | Open `Mods/pokedex_voice_over/debug.log` — it records every hook fire, file check, and TTS call. On a fresh install the most likely cause is "first-launch model download still running"; wait a couple of minutes on first run. |
+| Bundled Python extraction fails | Check `fish_speech/install_python.bat`'s output. If the network is blocked, manually download `python-3.12.7-embed-amd64.zip` from <https://www.python.org/ftp/python/3.12.7/> and drop it into `fish_speech/_embed/`, then re-run `Start_TTS_Server.bat`. |
+| pip bootstrap fails inside the bundled Python | Delete `fish_speech/python/` and `fish_speech/_embed/get-pip.py`, then re-run `Start_TTS_Server.bat`. The launcher will redownload and rebootstrap. |
+| First entry on first launch plays nothing | The model is downloading. Either pre-warm the server by double-clicking `Start_TTS_Server.bat` once before launching the game, or just wait for the second entry. |
+| `CUDA out of memory` in the sidecar window | Run `Start_TTS_Server.bat --device cpu` (or edit the .bat to add `--device cpu`). |
+| Voice sounds wrong | Replace `fish_speech/reference/voice.wav` with your own 15–20 s reference clip (see `fish_speech/reference/README.txt`). |
+| I want a clean reinstall | Delete `Mods/pokedex_voice_over/fish_speech/.installed` and `Mods/pokedex_voice_over/fish_speech/checkpoints/`, then relaunch. |
 
 ---
 
-## Repository Structure
+## Credits & License
 
-```
-KIF-Pokedex-Voice-Over/
-├── Mods/
-│   └── pokedex_voice_over/     ← copy this folder into your game's Mods/
-│       ├── mod.json            ← KIF mod manifest
-│       └── main.rb             ← Ruby plugin (hooks Pokédex scene + plays audio)
-├── tools/
-│   ├── generate_voices.py      ← Python script to generate TTS audio files
-│   ├── train_piper_voice.py    ← Python script to prepare Piper training data
-│   └── requirements.txt        ← Python dependencies
-└── README.md
-```
-
----
-
-## Contributing
-
-Pull requests and issue reports are welcome.  If you discover the exact
-instance-variable name KIF uses for the second fusion species, or the correct
-entry-page index for a specific KIF version, please open an issue or PR so
-the hook can be made more precise.
-
----
-
-## Licence
-
-This mod is released under the [MIT Licence](https://opensource.org/licenses/MIT).
-Pokémon is a trademark of Nintendo / Game Freak.  This is an unofficial fan
-project with no affiliation to Nintendo, Game Freak, or The Pokémon Company.
+* **fish-speech** by Fish Audio — Apache 2.0
+  ([github.com/fishaudio/fish-speech](https://github.com/fishaudio/fish-speech))
+* The bundled **reference voice clip** was generated from the public Fish
+  Audio [Pokédex Voice Over model](https://fish.audio/m/57a07a0af0954230a44d1db3adc77940/)
+  and is included only as the voice-clone target. You can replace it with
+  any other clip you prefer.
+* **Piper** by Rhasspy — MIT
+  ([github.com/rhasspy/piper](https://github.com/rhasspy/piper))
+* **Pokémon Infinite Fusion** by Chardub/Frogman
+* **Kuray's Infinite Fusion** by kurayamiblackheart and contributors
+* This mod is MIT-licensed. Pokémon trademarks belong to Nintendo / Game
+  Freak — this is a fan project, not affiliated with or endorsed by them.

@@ -1,5 +1,40 @@
+# Python build artifacts
 __pycache__/
 *.pyc
+*.pyo
+*.pyd
 
-# Diagnostic log written at runtime by the mod — user-specific, not committed
+# Bundled embeddable Python (extracted at first run inside the mod folder).
+# The extracted tree never belongs in git - it's recreated by install_python.bat.
+Mods/pokedex_voice_over/fish_speech/python/
+
+# Embeddable Python source ZIP + get-pip.py.  These can OPTIONALLY be
+# committed (or shipped in the release zip) for fully-offline first-run.
+# Default: don't track them - the launcher downloads them on demand.
+# To bundle them for offline first-run, run download_embeddable.bat and
+# then `git add -f Mods/pokedex_voice_over/fish_speech/_embed`.
+Mods/pokedex_voice_over/fish_speech/_embed/
+
+# Runtime logs and state written by the mod / sidecar
 Mods/pokedex_voice_over/debug.log
+Mods/pokedex_voice_over/fish_speech/server.log
+Mods/pokedex_voice_over/fish_speech/server.pid
+Mods/pokedex_voice_over/fish_speech/smoke_test.wav
+Mods/pokedex_voice_over/fish_speech/.installed
+Mods/pokedex_voice_over/fish_speech/.torch_cache/
+
+# Downloaded model weights (~1.4 GB, fetched at first launch from HuggingFace)
+Mods/pokedex_voice_over/fish_speech/checkpoints/
+
+# Local pip artifacts a shell glitch can drop here
+Mods/pokedex_voice_over/fish_speech/=*
+
+# Backup zips occasionally left behind by KIF's mod manager
+Mods/PreModManager*.zip
+
+# Editor / OS junk
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/

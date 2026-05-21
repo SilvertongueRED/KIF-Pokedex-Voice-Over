@@ -1,0 +1,49 @@
+# ============================================================================
+# Runtime (inference-only) dependencies for the VENDORED fish-speech 1.5 engine
+# (see ./vendor/).  Installed by setup.py with the bundled embeddable Python.
+#
+# torch + torchaudio are intentionally NOT listed here: setup.py installs them
+# from the CUDA (cu121) or CPU PyTorch channel, which this generic index can't
+# express.  Keep them out so a plain `pip install -r` never pulls a CPU build.
+#
+# This list is the exact set the vendored fish_speech inference path imports,
+# derived by walking the import graph from server.py's entry points INCLUDING
+# the modules Hydra instantiates from configs/firefly_gan_vq.yaml (spectrogram,
+# firefly, fsq).  The heavy training / ASR / web-UI deps that fish-speech's full
+# pyproject pulls (funasr, faster_whisper, datasets, gradio, tensorboard,
+# modelscope, silero-vad, pyaudio, wandb, ...) are deliberately OMITTED -
+# inference never imports them.  wandb is referenced only inside an unused
+# training helper (lazy import), so it is not required.
+# ============================================================================
+
+# --- core model + tokenizer ---
+transformers>=4.45.2,<5            # only AutoTokenizer is used; fish-speech ships its own LLaMA impl
+tiktoken>=0.8.0
+einops>=0.7.0
+vector_quantize_pytorch==1.14.24   # GroupedResidualFSQ used by the firefly VQ-GAN decoder (fsq.py)
+loralib>=0.1.2
+numpy>=1.24,<2                     # fish-speech 1.5 is numpy<2 only
+
+# --- request/response schema ---
+pydantic==2.9.2
+typing_extensions>=4.8
+
+# --- config / instantiation (Hydra builds the VQ-GAN decoder from YAML) ---
+hydra-core>=1.3.2
+omegaconf>=2.2,<2.4
+pyrootutils>=1.0.4
+
+# --- pulled in eagerly by fish_speech.utils.__init__ at import time ---
+lightning>=2.1.0
+pytorch-lightning>=2.1.0
+lightning-utilities>=0.10.0
+rich>=13.5.3
+
+# --- audio I/O + setup-time helpers ---
+soundfile>=0.12
+librosa>=0.10.1                    # setup.py uses it to normalise the reference WAV
+huggingface_hub>=0.23              # setup.py uses it to download the model weights
+loguru>=0.6.0
+natsort>=8.4.0
+tqdm>=4.62
+click>=8.0
