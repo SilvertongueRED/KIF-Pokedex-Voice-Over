@@ -518,8 +518,17 @@ class ModelHolder:
     def detect_device() -> str:
         try:
             import torch
-        except ImportError:
-            print("[fish-tts] WARNING: torch not installed - falling back to CPU.", file=sys.stderr)
+        except ImportError as exc:
+            # Both "torch genuinely not installed" and "torch present but its
+            # import blew up half-way" land here (ModuleNotFoundError is an
+            # ImportError).  Log the REAL exception so a broken / over-slimmed
+            # install is diagnosable, instead of silently masquerading as a
+            # CPU-only machine and then dying on the next import with a
+            # confusing "partially initialized torch / circular import".
+            log.error("torch import failed in detect_device: %r - falling back to CPU. "
+                      "If this machine has a GPU the install is broken; re-run setup.py.", exc)
+            print(f"[fish-tts] WARNING: torch import failed ({exc}) - falling back to CPU.",
+                  file=sys.stderr)
             return "cpu"
         if torch.cuda.is_available():
             name = torch.cuda.get_device_name(0)

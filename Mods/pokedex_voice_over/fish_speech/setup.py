@@ -448,16 +448,26 @@ def slim_install() -> None:
                 f.unlink()
             except OSError:
                 pass
-    for sub in ("include", "test", "testing", "_C_tests"):
+    # torch/include = C++ headers, torch/_C_tests = bundled C-extension tests,
+    # torch/test = bundled test scripts.  All are compile/dev-only and safe.
+    # NOTE: do NOT delete torch/testing.  That is the PUBLIC, importable
+    # torch.testing submodule that torch's own __init__ pulls in while it is
+    # importing.  Deleting it makes `import torch` abort half-way: the server
+    # then sees a partially-initialised torch (CUDA reported "unavailable",
+    # then "cannot import name 'nn' from partially initialized module 'torch'
+    # ... circular import").  That is the regression this line caused.
+    for sub in ("include", "test", "_C_tests"):
         d = site / "torch" / sub
         if d.exists():
             shutil.rmtree(d, ignore_errors=True)
 
     for pyc in site.rglob("__pycache__"):
         shutil.rmtree(pyc, ignore_errors=True)
-    for tests in list(site.glob("*/tests")) + list(site.glob("*/test")):
-        if tests.is_dir():
-            shutil.rmtree(tests, ignore_errors=True)
+    # NOTE: we deliberately do NOT blanket-delete "<pkg>/test" / "<pkg>/tests"
+    # across site-packages.  Several packages ship *importable* subpackages
+    # under those names, so nuking them risks breaking an import the inference
+    # path relies on.  The torch headers + .lib deleted above are by far the
+    # largest win; the marginal savings here are not worth the risk.
 
     after = _dir_size(site) if site.exists() else 0
     if before:
@@ -525,11 +535,20 @@ def main() -> int:
 
     prepare_reference(args.reference)
 
-    if not args.skip_smoke:
-        smoke_test()
-
+    # IMPORTANT ORDERING: slim BEFORE the smoke test.
+    #
+    # The smoke test loads the full model exactly the way server.py does, so it
+    # is our one chance to prove the *shipped* environment works.  If we slim
+    # AFTER it, the smoke test validates the un-slimmed install and a slim step
+    # that breaks torch sails through undetected - the failure only surfaces
+    # later, when the player launches the game.  Slimming first means the smoke
+    # test exercises the real, trimmed environment, and setup exits non-zero
+    # (leaving .installed unwritten) if the trim broke anything.
     if not args.skip_install and not args.no_slim:
         slim_install()
+
+    if not args.skip_smoke:
+        smoke_test()
 
     print()
     ok("All done.  Launch the server with:")
