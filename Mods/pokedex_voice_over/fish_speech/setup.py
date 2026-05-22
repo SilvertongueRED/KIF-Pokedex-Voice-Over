@@ -414,12 +414,33 @@ def _dir_size(path: Path) -> int:
 
 
 def _site_packages() -> Path:
+    # Cross-platform: sysconfig reports this interpreter's real site-packages
+    # (Linux/macOS venv -> lib/pythonX.Y/site-packages; Windows embeddable ->
+    # Lib/site-packages).
+    import sysconfig
+    for key in ("purelib", "platlib"):
+        sp = sysconfig.get_paths().get(key)
+        if sp and Path(sp).exists():
+            return Path(sp)
     base = Path(sys.executable).resolve().parent
     cand = base / "Lib" / "site-packages"
     if cand.exists():
         return cand
-    found = list(base.rglob("site-packages"))
+    found = list(base.parent.rglob("site-packages"))
     return found[0] if found else cand
+
+
+def _is_mod_owned_env() -> bool:
+    """True only when running from the mod's OWN interpreter - the Windows
+    embeddable python/ or the Linux/macOS venv/, both of which live directly
+    under this fish_speech folder.  Refuse to slim a shared/system Python so we
+    never uninstall packages or delete torch files the user relies on
+    elsewhere."""
+    try:
+        prefix = Path(sys.prefix).resolve()
+        return HERE == prefix or HERE in prefix.parents
+    except Exception:
+        return False
 
 
 def slim_install() -> None:
@@ -427,10 +448,16 @@ def slim_install() -> None:
 
     Idempotent and safe to run after every (re)install.  It (1) uninstalls
     packages the inference path never imports, (2) deletes torch's compile-only
-    artefacts (*.lib, C++ headers, bundled tests), and (3) drops __pycache__ and
+    artefacts (*.lib / *.a, C++ headers, bundled tests), and (3) drops __pycache__ and
     packaged test suites.  It never touches the CUDA runtime DLLs or the model
     weights, so GPU inference and clone fidelity are unchanged.
     """
+    if not _is_mod_owned_env():
+        warn("Skipping slim pass - not running from the mod's own interpreter "
+             "(a shared/system Python was detected).  Launch via "
+             "Start_TTS_Server.bat or start_tts_server.sh so the bundled / venv "
+             "interpreter is used; slimming then runs automatically.")
+        return
     info("Slimming the install to the inference-only footprint...")
     site = _site_packages()
     before = _dir_size(site) if site.exists() else 0
@@ -443,11 +470,14 @@ def slim_install() -> None:
 
     torch_lib = site / "torch" / "lib"
     if torch_lib.exists():
-        for f in torch_lib.glob("*.lib"):
-            try:
-                f.unlink()
-            except OSError:
-                pass
+        # *.lib (Windows) and *.a (Linux/macOS) are compile-only static / import
+        # libraries; runtime inference loads the *.dll / *.so instead.
+        for pattern in ("*.lib", "*.a"):
+            for f in torch_lib.glob(pattern):
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
     # torch/include = C++ headers, torch/_C_tests = bundled C-extension tests,
     # torch/test = bundled test scripts.  All are compile/dev-only and safe.
     # NOTE: do NOT delete torch/testing.  That is the PUBLIC, importable
