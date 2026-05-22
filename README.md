@@ -68,6 +68,40 @@ the launcher once before opening the game:
 
 Leave the terminal open. When the game closes, the mod closes it for you.
 
+### On Linux & macOS
+
+Auto-start is fully cross-platform: when you launch KIF the mod spawns
+`start_tts_server.sh` in the background on its own (same as Windows, and on by
+default), so in the common case you don't have to do anything.
+
+There is one caveat for the **very first** launch. Auto-start runs the script
+detached with no terminal attached, which means:
+
+* If **Python 3.10+ is not already installed**, the script tries to install it
+  with your package manager via `sudo` — which cannot ask for a password from a
+  background process, so the silent auto-start cannot bootstrap Python.
+* The one-time ~3 GB download (PyTorch + model) runs silently with no visible
+  progress.
+
+So on Linux/macOS it is best to **run the launcher once in a terminal for the
+first install**, then let auto-start take over from then on:
+
+```bash
+cd "<KIF game root>/Mods/pokedex_voice_over/fish_speech"
+bash ./start_tts_server.sh
+```
+
+This creates an isolated `./venv` inside the mod folder, installs PyTorch and
+the engine dependencies into it (you will see progress, plus any `sudo` prompt
+to install Python), downloads the model, and runs a quick smoke test. Nothing
+is installed into your system Python. Once it finishes, every later game launch
+auto-starts the server silently — exactly like Windows.
+
+**Prerequisite:** Python 3.10+ with the `venv` module. On Debian/Ubuntu:
+`sudo apt-get install -y python3 python3-venv` (Fedora, Arch and openSUSE ship
+`venv` with `python3`). For a clean reinstall later, delete `fish_speech/venv/`
+and `fish_speech/.installed`, then relaunch.
+
 ---
 
 ## Features
