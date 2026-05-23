@@ -125,6 +125,16 @@ module PokedexVoiceOver
   FISH_SPEECH_PORT = 7861
   FISH_SPEECH_DIR  = "Mods/pokedex_voice_over/fish_speech"
 
+  # Do not re-spawn the sidecar more often than this (seconds).  The
+  # autostart path is throttled rather than one-shot so the server can
+  # self-heal after an idle-timeout/crash without launching a storm of
+  # launcher windows while it is still loading.
+  FISH_SPEECH_AUTOSTART_RETRY_SECS = 30.0
+  # When the sidecar is known-DOWN, re-poll /health this often (seconds)
+  # instead of caching the "down" verdict for the full positive-result
+  # minute, so a freshly auto-restarted server is picked up promptly.
+  FISH_SPEECH_DOWN_RECHECK_SECS = 5.0
+
   # How long (seconds) to wait for /tts to return a WAV.  Fish-Speech needs a
   # generous ceiling on slower CPUs - entries with several sentences can take
   # 10-30s.  After this we fall through to Piper.
@@ -406,8 +416,14 @@ module PokedexVoiceOver
   # Cached for one minute so repeat dex entries do not re-poll.
   def self.fish_speech_available?
     now = Time.now.to_f
-    if defined?(@fish_speech_ok_at) && @fish_speech_ok_at && (now - @fish_speech_ok_at) < 60
-      return @fish_speech_ok
+    if defined?(@fish_speech_ok_at) && @fish_speech_ok_at
+      # Cache a positive result for 60s (cheap to assume the server is
+      # still up), but re-poll a negative result every few seconds.
+      # Otherwise a sidecar that has just been auto-restarted would keep
+      # reporting "down" for a full minute after it has actually come
+      # back, stranding the player in silence far longer than necessary.
+      ttl = @fish_speech_ok ? 60 : FISH_SPEECH_DOWN_RECHECK_SECS
+      return @fish_speech_ok if (now - @fish_speech_ok_at) < ttl
     end
     @fish_speech_ok = _fish_speech_ping
     @fish_speech_ok_at = now
@@ -700,8 +716,20 @@ module PokedexVoiceOver
   # no cmd /c wrapper, no relative-path / CWD coupling — and log the
   # system() return value so future regressions are obvious.
   def self._fish_speech_try_autostart
-    return if @fish_speech_autostart_attempted
-    @fish_speech_autostart_attempted = true
+    # Throttled retry (NOT a permanent one-shot).  Previously this
+    # latched a flag to true forever after the first attempt, so if the
+    # sidecar ever died mid-session (idle-timeout, kill, or crash) the
+    # mod could NEVER restart it and every later dex entry fell through
+    # to Piper/silence.  We now allow a fresh spawn at most once per
+    # FISH_SPEECH_AUTOSTART_RETRY_SECS, letting the sidecar self-heal on
+    # the next entry without spawning a storm of launcher windows while
+    # it loads.
+    now = Time.now.to_f
+    if defined?(@fish_speech_autostart_at) && @fish_speech_autostart_at &&
+       (now - @fish_speech_autostart_at) < FISH_SPEECH_AUTOSTART_RETRY_SECS
+      return
+    end
+    @fish_speech_autostart_at = now
     return unless fish_speech_autostart?
 
     win = RUBY_PLATFORM.to_s =~ /mswin|mingw|windows/i

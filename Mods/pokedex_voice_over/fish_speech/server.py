@@ -1033,11 +1033,26 @@ def main() -> int:
     _write_pid_file()
     _install_signal_handlers()
     _bump_activity()
-    if args.idle_timeout and args.idle_timeout > 0:
+    # Arm the idle-shutdown watchdog ONLY when there is no live parent
+    # process to monitor.  When the game passes --parent-pid (it always
+    # does), the parent-PID monitor below is the real safety net: it
+    # shuts the server down within ~5s of the game closing, even when
+    # at_exit never fires.  In that case the idle watchdog has no job to
+    # do except kill a perfectly healthy, in-use server after a few quiet
+    # minutes of play -- exactly the mid-session "TTS just stopped"
+    # failure this guards against.  Manual launches with no --parent-pid
+    # still get the idle watchdog as orphan protection.
+    parent_is_monitored = bool(args.parent_pid and args.parent_pid > 0
+                               and _is_pid_alive(args.parent_pid))
+    if args.idle_timeout and args.idle_timeout > 0 and not parent_is_monitored:
         threading.Thread(target=_idle_watchdog,
                          args=(args.idle_timeout,),
                          name="fish-tts-idle-watchdog",
                          daemon=True).start()
+    elif parent_is_monitored:
+        log.info("Idle watchdog disabled: parent pid %d is being monitored "
+                 "(parent-PID monitor is the shutdown safety net).",
+                 args.parent_pid)
     if args.parent_pid and args.parent_pid > 0:
         # Primary shutdown path for the "game closed without at_exit firing"
         # case (common with MKXP-Z on Windows).
