@@ -2778,6 +2778,48 @@ if defined?(PokemonPokedexInfo_Scene)
     end
 
     # ------------------------------------------------------------------
+    # pbStartSceneBrief — the "brief"/single-entry scene KIF uses to show a
+    # Pokédex entry right after capturing/creating a NEW species.  This is the
+    # path taken after a fusion is made:
+    #   PokemonFusion -> pbShowPokedex(newSpecies)
+    #     -> PokemonPokedexInfoScreen#pbDexEntry(species)
+    #       -> @scene.pbStartSceneBrief(species) + pbSceneBrief + pbEndScene
+    # The normal browsing hook (drawPage) is suppressed here (see
+    # @dex_vo_in_brief below) because the brief scene draws its single page
+    # directly and never loops through the page-change path, so we trigger
+    # playback explicitly once the original has drawn the page — which also
+    # captures the entry text via the drawEntryText hook.  pbEndScene (already
+    # aliased) stops the voice and restores BGM when the player closes the
+    # entry, exactly like every other Pokédex scene.
+    # ------------------------------------------------------------------
+    if method_defined?(:pbStartSceneBrief)
+      PokedexVoiceOver.log("  Aliasing pbStartSceneBrief (post-fusion / new-species entry)")
+      alias dex_vo_orig_pbStartSceneBrief pbStartSceneBrief
+
+      def pbStartSceneBrief(*args)
+        # Suppress the drawPage auto-play while the brief scene draws its page;
+        # we drive playback ourselves right after, so we never double-narrate.
+        @dex_vo_in_brief = true
+        begin
+          dex_vo_orig_pbStartSceneBrief(*args)
+        ensure
+          @dex_vo_in_brief = false
+        end
+
+        head, fused = pokedex_vo_current_species
+        @dex_vo_last_species = [head, fused]
+        @dex_vo_pending_play = false
+        text = pokedex_vo_displayed_text
+        PokedexVoiceOver.log("pbStartSceneBrief fired (post-fusion/new-species) — " \
+          "head=#{head.inspect}, fused=#{fused.inspect}, " \
+          "text=#{text ? text[0, 40].inspect : 'nil'}")
+        PokedexVoiceOver.play(head, fused, text)
+      end
+    else
+      PokedexVoiceOver.log("  pbStartSceneBrief is NOT defined — post-fusion entry will not narrate")
+    end
+
+    # ------------------------------------------------------------------
     # pbShowPage  — play (optionally) when returning to the entry page
     # ------------------------------------------------------------------
     if method_defined?(:pbShowPage)
@@ -2857,7 +2899,7 @@ if defined?(PokemonPokedexInfo_Scene)
 
           PokedexVoiceOver.log("drawPage fired — page=#{page.inspect}, prev=#{prev_page.inspect}, play_on_change=#{PokedexVoiceOver.play_on_page_change?}")
 
-          if page == POKEDEX_VO_ENTRY_PAGE
+          if page == POKEDEX_VO_ENTRY_PAGE && !@dex_vo_in_brief
             head, fused = pokedex_vo_current_species
             current_species = [head, fused]
             species_changed = current_species != @dex_vo_last_species
