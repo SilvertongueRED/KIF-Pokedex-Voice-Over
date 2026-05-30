@@ -233,6 +233,26 @@ def _load_fish_speech_1_5(checkpoint_dir: Path, device: str, compile_model: bool
     """
     import torch
 
+    # -------------------------------------------------------------------------
+    # Free GPU speedups (CUDA only).  None of these change the audio output in
+    # any audible way, they just let the 4090's tensor cores run the matmuls
+    # faster:
+    #   * allow_tf32          - use TF32 for fp32 matmuls/conv (Ampere/Ada).
+    #   * set_float32_matmul_precision("high") - same idea, newer API surface.
+    #   * cudnn.benchmark     - autotune conv kernels for our fixed shapes.
+    # These help the prefill / decoder matmuls regardless of torch.compile, so
+    # they are always worth setting and are the safe baseline win.
+    # -------------------------------------------------------------------------
+    if device == "cuda":
+        try:
+            torch.backends.cuda.matmul.allow_tf32 = True
+            torch.backends.cudnn.allow_tf32 = True
+            torch.backends.cudnn.benchmark = True
+            torch.set_float32_matmul_precision("high")
+            log.info("CUDA math tuning enabled (TF32 matmul + cudnn.benchmark).")
+        except Exception as exc:
+            log.debug("CUDA math tuning skipped: %s", exc)
+
     # Use float16 on CUDA (matches fish-speech training precision, faster on GPU
     # tensor cores).  Bfloat16 on CPU/MPS to avoid float16 underflow off-GPU.
     precision = torch.float16 if device == "cuda" else torch.bfloat16
@@ -240,6 +260,23 @@ def _load_fish_speech_1_5(checkpoint_dir: Path, device: str, compile_model: bool
     # torch.compile only helps on CUDA.  Force-disable on CPU/MPS regardless
     # of what the user asked for - saves us debugging weird Triton errors.
     do_compile = bool(compile_model) and device == "cuda"
+
+    # SAFETY NET: when we ask for torch.compile, tell TorchDynamo to fall back
+    # to plain eager execution if anything in the compile pipeline fails
+    # (e.g. Triton missing on a Windows box where setup.py couldn't install
+    # triton-windows).  Without this a compile failure would raise on the first
+    # /tts and break narration entirely; with it the mod just runs uncompiled
+    # (no speedup, but no feature loss).  cache_size_limit is bumped so the
+    # handful of sequence-length specialisations we hit don't thrash the cache.
+    if do_compile:
+        try:
+            import torch._dynamo
+            torch._dynamo.config.suppress_errors = True
+            torch._dynamo.config.cache_size_limit = 64
+            log.info("torch.compile requested - dynamo suppress_errors ON "
+                     "(falls back to eager if Triton/inductor is unavailable).")
+        except Exception as exc:
+            log.debug("Could not configure torch._dynamo: %s", exc)
 
     from fish_speech.models.text2semantic.inference import launch_thread_safe_queue
     from fish_speech.models.vqgan.inference import load_model as load_decoder_model
@@ -930,11 +967,14 @@ def main() -> int:
     # this file) mean that turning compile back on later only pays the full
     # JIT cost once across all future launches.
     parser.add_argument("--compile", dest="compile_model", action="store_true",
-                        default=False,
-                        help="Enable torch.compile() for 2-3x faster inference on CUDA. "
-                             "Adds ~30-90 s to the FIRST launch only (cache persists).")
+                        default=True,
+                        help="Enable torch.compile() for 2-3x faster inference on CUDA "
+                             "(DEFAULT ON). Adds ~30-90 s to the FIRST launch only "
+                             "(the inductor kernel cache in .torch_cache persists, so "
+                             "every later launch is fast). No effect on CPU/MPS.")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false",
-                        help="Disable torch.compile() (default - fastest startup).")
+                        help="Disable torch.compile(). Use only if compile is failing "
+                             "on this machine - inference will be 2-3x slower on CUDA.")
     parser.add_argument("--full-warmup", action="store_true", default=False,
                         help="Run a second, longer warmup pass after model load. "
                              "Only useful when --compile is on; adds ~20 s.")
@@ -953,6 +993,14 @@ def main() -> int:
                              "Pass the game's process ID so the server shuts down when "
                              "the game closes (even if at_exit doesn't fire).")
     args = parser.parse_args()
+
+    # When compile is on (the default on CUDA), pre-warm thoroughly: the second
+    # warmup pass generates a longer sentence so torch.compile specialises the
+    # kernels for realistic Pokedex-entry sequence lengths DURING startup -
+    # i.e. while the player is still walking to the Pokedex - instead of paying
+    # that JIT cost on the first real entry.  Skipped entirely under --fast-start.
+    if args.compile_model and not args.fast_start:
+        args.full_warmup = True
 
     if not args.checkpoint_dir.exists():
         print(f"[fish-tts] ERROR: checkpoint dir not found: {args.checkpoint_dir}",

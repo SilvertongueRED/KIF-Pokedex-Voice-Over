@@ -223,6 +223,47 @@ def install_torch(use_cuda: bool) -> None:
     ok("torch installed.")
 
 
+def install_triton(use_cuda: bool) -> None:
+    """Install Triton so torch.compile's inductor backend works on CUDA.
+
+    server.py now enables torch.compile by default on CUDA, which gives a
+    2-3x inference speedup - but the inductor backend needs Triton to JIT the
+    GPU kernels.  On Linux/macOS Triton ships as a dependency of the CUDA torch
+    wheel, so there is normally nothing to do.  On WINDOWS, PyTorch publishes
+    no Triton wheel at all, so we install the community `triton-windows` build
+    whose 3.1.x line matches the torch 2.5.x we pull from the cu121 channel.
+
+    Best-effort by design: if the wheel can't be installed (offline, unusual
+    ABI, etc.) we warn and carry on.  server.py sets torch._dynamo
+    suppress_errors, so a missing Triton just means compile silently falls back
+    to eager execution - the mod still narrates fine, it just loses the 2-3x.
+    """
+    if not use_cuda:
+        return  # Triton only matters for the CUDA inductor backend.
+    if _module_importable("triton"):
+        ok("Triton already present - torch.compile inductor backend ready.")
+        return
+    if sys.platform == "win32":
+        info("Installing triton-windows (enables torch.compile speedup on Windows)...")
+        try:
+            # 3.1.x is the line matched to torch 2.5.x (cu121 channel's top).
+            run_pip(["triton-windows>=3.1,<3.2"])
+            ok("triton-windows installed - torch.compile speedup enabled.")
+        except Exception as exc:
+            warn(f"Could not install triton-windows ({exc}). torch.compile will "
+                 f"fall back to eager mode - TTS still works, just without the "
+                 f"2-3x speedup. You can retry later or run the server with "
+                 f"--no-compile to silence the fallback log noise.")
+    else:
+        info("Installing triton (enables torch.compile speedup)...")
+        try:
+            run_pip(["triton>=3.1,<3.2"])
+            ok("triton installed - torch.compile speedup enabled.")
+        except Exception as exc:
+            warn(f"Could not install triton ({exc}). torch.compile will fall "
+                 f"back to eager mode.")
+
+
 def install_fish_speech() -> None:
     """Install the inference-only leaf dependencies for the VENDORED engine.
 
@@ -559,6 +600,10 @@ def main() -> int:
         # make sure nothing quietly swapped torch for a CPU wheel.  This call is
         # a fast no-op when the CUDA build is still in place.
         install_torch(use_cuda)
+        # Triton powers torch.compile's inductor backend (the 2-3x CUDA win).
+        # Done AFTER the torch re-check so it installs against the final,
+        # known-good CUDA torch build.  No-op on CPU installs.
+        install_triton(use_cuda)
 
     if not args.skip_download:
         download_model(args.hf_token)
