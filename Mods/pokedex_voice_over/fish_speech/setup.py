@@ -264,6 +264,109 @@ def install_triton(use_cuda: bool) -> None:
                  f"back to eager mode.")
 
 
+def provision_python_dev_files(use_cuda: bool) -> None:
+    """Give the bundled embeddable Python the C headers + import libs that
+    torch.compile's INDUCTOR backend (via Triton) needs to build its launcher.
+
+    The Windows 'embeddable' Python ships WITHOUT Include/ (Python.h) and
+    libs/python3.lib.  triton-windows looks for them and, when missing, fails
+    with 'Python.h not found' / 'Failed to find Python libs', so inductor
+    silently falls back to uncompiled (no speedup).  We fetch them from the
+    official 'python' NuGet package (the same CPython build, redistributable)
+    and drop them next to python.exe; triton then finds them automatically.
+
+    Best-effort and Windows-embeddable-ONLY: a normal/system Python already has
+    these, and any failure here just means inductor won't engage (cudagraphs and
+    uncompiled generation still work).
+    """
+    if not use_cuda or sys.platform != "win32":
+        return
+    if not _is_mod_owned_env():
+        return  # never modify a shared/system Python
+    base = Path(sys.executable).resolve().parent  # the mod's python/ folder
+    inc = base / "Include"
+    libs = base / "libs"
+    if (inc / "Python.h").exists() and (libs / "python3.lib").exists():
+        ok("Python dev headers/libs already present (inductor can compile).")
+        return
+
+    # Prefer the dev files BUNDLED with the mod (offline + deterministic): the
+    # embeddable Python omits Include/ + libs/, so we ship a known-good copy in
+    # fish_speech/python_dev/ and just drop it next to python.exe.  No network.
+    bundled = HERE / "python_dev"
+    if (bundled / "Include" / "Python.h").exists() and (bundled / "libs" / "python3.lib").exists():
+        try:
+            import shutil
+            inc.mkdir(parents=True, exist_ok=True)
+            libs.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(bundled / "Include", inc, dirs_exist_ok=True)
+            shutil.copytree(bundled / "libs", libs, dirs_exist_ok=True)
+            if (inc / "Python.h").exists() and (libs / "python3.lib").exists():
+                ok(f"Installed bundled Python dev headers/libs into {base} "
+                   f"(inductor can compile - no download needed).")
+                return
+            warn("Bundled dev-file copy incomplete - trying NuGet download.")
+        except Exception as exc:
+            warn(f"Could not copy bundled dev files ({exc}) - trying NuGet download.")
+
+    vi = sys.version_info
+    versions = [f"{vi.major}.{vi.minor}.{vi.micro}"]
+    for micro in (10, 9, 8, 7, 6, 4):  # known-good 3.x.y fallbacks on NuGet
+        v = f"{vi.major}.{vi.minor}.{micro}"
+        if v not in versions:
+            versions.append(v)
+
+    import io as _io
+    import zipfile
+    import urllib.request
+
+    info("Fetching Python dev headers/libs for the embeddable interpreter "
+         "(needed by the inductor backend; cudagraphs/uncompiled do not need them)...")
+    nupkg = None
+    for v in versions:
+        url = f"https://www.nuget.org/api/v2/package/python/{v}"
+        try:
+            info(f"  trying NuGet python {v} ...")
+            with urllib.request.urlopen(url, timeout=60) as resp:
+                data = resp.read()
+            nupkg = zipfile.ZipFile(_io.BytesIO(data))
+            ok(f"  downloaded python {v} dev package.")
+            break
+        except Exception as exc:
+            warn(f"  {v}: {exc}")
+    if nupkg is None:
+        warn("Could not download Python dev files. The inductor backend will "
+             "not engage; use --compile-backend cudagraphs, or point "
+             "POKEDEX_VO_PYTHON at a full Python install. (Uncompiled still works.)")
+        return
+    try:
+        inc.mkdir(parents=True, exist_ok=True)
+        libs.mkdir(parents=True, exist_ok=True)
+        n_inc = n_lib = 0
+        for name in nupkg.namelist():
+            if name.endswith("/"):
+                continue
+            low = name.lower()
+            if low.startswith("tools/include/"):
+                dest = inc / name[len("tools/include/"):]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(nupkg.read(name))
+                n_inc += 1
+            elif low.startswith("tools/libs/"):
+                dest = libs / name[len("tools/libs/"):]
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                dest.write_bytes(nupkg.read(name))
+                n_lib += 1
+        if (inc / "Python.h").exists() and (libs / "python3.lib").exists():
+            ok(f"Installed {n_inc} headers -> {inc} and {n_lib} libs -> {libs} "
+               f"(inductor can now compile).")
+        else:
+            warn(f"Copied {n_inc} headers / {n_lib} libs but Python.h or "
+                 f"python3.lib still missing - inductor may not engage.")
+    except Exception as exc:
+        warn(f"Failed to install Python dev files ({exc}). inductor may not engage.")
+
+
 def install_fish_speech() -> None:
     """Install the inference-only leaf dependencies for the VENDORED engine.
 
@@ -604,6 +707,17 @@ def main() -> int:
         # Done AFTER the torch re-check so it installs against the final,
         # known-good CUDA torch build.  No-op on CPU installs.
         install_triton(use_cuda)
+        # Give the embeddable Python the headers/libs Triton needs so the
+        # inductor backend can actually compile (the 2-3x win).  No-op if they
+        # are already present or on a non-embeddable/CPU install.
+        provision_python_dev_files(use_cuda)
+        # A fresh (re)install may have fixed whatever blocked compile before, so
+        # clear the "compile failed here" marker and let the server re-attempt.
+        try:
+            (HERE / ".compile_disabled").unlink()
+            info("Cleared .compile_disabled - server will re-attempt compile.")
+        except OSError:
+            pass
 
     if not args.skip_download:
         download_model(args.hf_token)

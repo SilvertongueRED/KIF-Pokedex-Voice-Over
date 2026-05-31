@@ -103,7 +103,20 @@ echo and takes ~5-15 seconds (longer on the very first launch with --compile).
 echo Leave this window open while you play.  Press Ctrl+C to stop.
 echo.
 
-"%PYCMD%" server.py %*
+REM ---------------------------------------------------------------------------
+REM torch.compile (~2-3x faster generation on CUDA) is ON BY DEFAULT in
+REM server.py.  setup.py installs everything it needs (Triton + Python dev
+REM files); the server verifies a real generation and silently falls back to
+REM uncompiled if compile cannot work on this machine, so it can NEVER silence
+REM the mod.  A machine where compile fails remembers that and skips it next
+REM time.  To force it OFF, set POKEDEX_VO_COMPILE=0 or create disable_compile.flag.
+REM See COMPILE_GUIDE.md.
+REM ---------------------------------------------------------------------------
+set "COMPILE_ARGS="
+if "%POKEDEX_VO_COMPILE%"=="0" set "COMPILE_ARGS=--no-compile"
+if exist "disable_compile.flag" set "COMPILE_ARGS=--no-compile"
+
+"%PYCMD%" server.py %COMPILE_ARGS% %*
 set "FISHTTS_EXIT=!ERRORLEVEL!"
 
 if not "!FISHTTS_EXIT!"=="0" (

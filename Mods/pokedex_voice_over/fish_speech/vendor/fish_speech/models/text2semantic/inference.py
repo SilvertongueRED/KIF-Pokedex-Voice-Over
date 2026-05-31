@@ -692,12 +692,31 @@ def load_model(checkpoint_path, device, precision, compile=False, is_agent=False
         logger.info("Using NaiveTransformer")
 
     if compile:
-        logger.info("Compiling function...")
+        # Backend + mode are configurable via env so the KIF mod can pick the
+        # acceleration path that actually works on the user's machine:
+        #   * cudagraphs (DEFAULT on the KIF mod) - captures the decode loop into
+        #     CUDA graphs.  Needs NEITHER Triton NOR an MSVC C++ compiler, so it
+        #     works on the bundled embeddable Python on Windows.  Good speedup.
+        #   * inductor - upstream fish-speech default; fastest, but needs Triton
+        #     AND a host C++ compiler (cl.exe), which a stock Windows install
+        #     lacks - hence it silently falls back to eager there.
+        # `mode` ("default"/"reduce-overhead") is an INDUCTOR-only concept, so we
+        # only forward it for the inductor backend (passing it to cudagraphs
+        # raises).
+        _backend = os.environ.get("POKEDEX_VO_COMPILE_BACKEND", "").strip().lower()
+        if not _backend:
+            _backend = "inductor" if torch.cuda.is_available() else "aot_eager"
+        _kw = {}
+        if _backend == "inductor" and torch.cuda.is_available():
+            _mode = os.environ.get("POKEDEX_VO_COMPILE_MODE", "default").strip().lower()
+            if _mode not in ("", "none"):
+                _kw["mode"] = _mode
+        logger.info(f"Compiling function... (backend={_backend} mode={_kw.get('mode')})")
         decode_one_token = torch.compile(
             decode_one_token,
             fullgraph=True,
-            backend="inductor" if torch.cuda.is_available() else "aot_eager",
-            mode="reduce-overhead" if torch.cuda.is_available() else None,
+            backend=_backend,
+            **_kw,
         )
 
     return model.eval(), decode_one_token

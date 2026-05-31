@@ -548,6 +548,74 @@ def _warmup_kernels(engine, ref_audio_bytes: Optional[bytes], ref_text: str,
 # Model loader
 # ---------------------------------------------------------------------------
 
+def _verify_generation(engine, ref_audio_bytes, ref_text, compiled: bool = False):
+    """Run ONE real generation and confirm it produces audio.
+
+    Returns (True, None) on success or (False, "<reason>") on failure.  When
+    `compiled` is True this call also triggers the torch.compile JIT, so it can
+    take ~30-90 s the first time on a cold inductor cache.  This is the heart of
+    the verify-then-commit safety net: a compiled engine that cannot actually
+    generate is detected HERE (before the server is marked ready), so the mod is
+    never left returning silence.
+    """
+    try:
+        from fish_speech.utils.schema import ServeTTSRequest, ServeReferenceAudio
+        refs = []
+        if ref_audio_bytes:
+            refs = [ServeReferenceAudio(audio=ref_audio_bytes, text=ref_text)]
+        req = ServeTTSRequest(
+            text="The Pokedex voice is ready.",
+            references=refs,
+            use_memory_cache="on",
+            max_new_tokens=128,
+            temperature=0.6,
+            top_p=0.85,
+            streaming=False,
+        )
+        log.info("Verifying generation%s (the first compiled run also JIT-compiles)...",
+                 " [compiled]" if compiled else "")
+        t0 = time.time()
+        got_audio = False
+        for result in engine.inference(req):
+            code = getattr(result, "code", None)
+            if code == "error":
+                return False, f"engine error: {getattr(result, 'error', 'unknown')}"
+            if code in ("final", "segment") and getattr(result, "audio", None) is not None:
+                _sr, samples = result.audio
+                if samples is not None and len(samples) > 0:
+                    got_audio = True
+        if not got_audio:
+            return False, "engine produced no audio"
+        log.info("Verification generation OK in %.1fs%s",
+                 time.time() - t0, " [compiled]" if compiled else "")
+        return True, None
+    except Exception as exc:
+        log.exception("Verification generation raised")
+        return False, f"{exc.__class__.__name__}: {exc}"
+
+
+def _free_engine(engine) -> None:
+    """Best-effort release of a discarded engine's GPU memory.
+
+    Used when a compiled engine fails verification and we rebuild uncompiled.
+    The vendored LLaMA queue owns a worker thread we cannot cleanly stop, but
+    dropping references + emptying the CUDA cache reclaims the bulk of the VRAM
+    before the second (uncompiled) model loads.
+    """
+    try:
+        import gc
+        import torch
+        try:
+            del engine
+        except Exception:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception as exc:
+        log.debug("engine free skipped: %s", exc)
+
+
 class ModelHolder:
     """Loads fish-speech once and holds the engine + reference prompt."""
 
@@ -610,15 +678,49 @@ class ModelHolder:
                 return
 
             device = device_override or cls.detect_device()
+            want_compile = bool(compile_model) and device == "cuda"
             log.info("Loading fish-speech 1.5 (device=%s, ckpt=%s, compile=%s)",
-                     device, checkpoint_dir, compile_model)
+                     device, checkpoint_dir, want_compile)
 
             try:
-                engine, precision, compiled = _load_fish_speech_1_5(
-                    checkpoint_dir, device, compile_model)
-
                 prompt_text = ref_txt.read_text(encoding="utf-8").strip() if ref_txt.exists() else ""
                 ref_audio_bytes = ref_wav.read_bytes() if ref_wav.exists() else None
+
+                # Build the engine (compiled only if requested AND on CUDA).
+                engine, precision, compiled = _load_fish_speech_1_5(
+                    checkpoint_dir, device, want_compile)
+
+                # --------------------------------------------------------------
+                # VERIFY-THEN-COMMIT - the safety net that makes enabling
+                # compile impossible to turn into "no audio".  We run a REAL
+                # generation now and only flip ready=True once it has actually
+                # produced audio.  When compiled, this first generation also
+                # pays the torch.compile JIT (~30-90 s the very first time; the
+                # inductor cache makes later launches fast).  If the COMPILED
+                # engine fails to generate (Triton missing/broken, a bad kernel,
+                # etc.) we discard it and rebuild WITHOUT compile, then verify
+                # again - so the worst case is "no speedup", never silence.
+                # --------------------------------------------------------------
+                if not skip_warmup:
+                    _prime_reference(engine, ref_audio_bytes, prompt_text)
+                ok, err = _verify_generation(engine, ref_audio_bytes, prompt_text,
+                                             compiled=compiled)
+                if not ok and want_compile:
+                    _model_state["compile_note"] = err
+                    log.warning("Compiled engine FAILED verification (%s) - "
+                                "rebuilding WITHOUT torch.compile so narration "
+                                "still works (no speedup, but no silence).", err)
+                    _free_engine(engine)
+                    engine, precision, compiled = _load_fish_speech_1_5(
+                        checkpoint_dir, device, False)
+                    if not skip_warmup:
+                        _prime_reference(engine, ref_audio_bytes, prompt_text)
+                    ok, err = _verify_generation(engine, ref_audio_bytes,
+                                                 prompt_text, compiled=False)
+                if not ok:
+                    _model_state["load_error"] = f"Generation verification failed: {err}"
+                    log.error("fish-speech load failed verification: %s", err)
+                    return
 
                 _model_state["engine"] = engine
                 _model_state["precision"] = precision
@@ -627,6 +729,8 @@ class ModelHolder:
                 _model_state["prompt_audio_bytes"] = ref_audio_bytes
                 _model_state["api_version"] = "1.5"
                 _model_state["compiled"] = compiled
+                if compiled:
+                    _model_state["compile_note"] = None
                 _model_state["ready"] = True
                 log.info("fish-speech ready (api=1.5 device=%s compiled=%s ref=%s transcript=%d chars)",
                          device, compiled, ref_wav.exists(), len(prompt_text))
@@ -642,34 +746,20 @@ class ModelHolder:
                 return
 
         # ------------------------------------------------------------------
-        # Warmup is intentionally OUTSIDE the lock - the model is fully
-        # constructed at this point and fish-speech's LLaMA queue is
-        # thread-safe under concurrent inference.  This means /health
-        # answers "ready" the instant the weights are in memory, and the
-        # first /tts request races with (or shortly follows) the warmup.
+        # Optional extra warmup pass OUTSIDE the lock (daemon thread, never
+        # joined).  Only meaningful when we actually ended up compiled - it
+        # specialises the compiled kernels for a longer sequence so the first
+        # multi-sentence entry is already fast.  Generation already works at
+        # this point (verified above), so this is pure best-effort polish.
         # ------------------------------------------------------------------
-
-        # Phase A - prime the reference encoding.  Cheap, always synchronous.
-        # If we have a disk-cached encoding for this exact reference WAV we
-        # skip the encode entirely; otherwise we encode once and persist the
-        # result for next time.
-        if not skip_warmup:
-            _prime_reference(engine, ref_audio_bytes, prompt_text)
-
-            # Phase B - kernel warmup on a daemon thread.  We DO NOT
-            # join() this thread - the server is allowed to start serving
-            # the moment phase A returns.
-            warmup_thread = threading.Thread(
+        if not skip_warmup and full_warmup and _model_state.get("compiled"):
+            threading.Thread(
                 target=_warmup_kernels,
-                args=(engine, ref_audio_bytes, prompt_text, compiled),
-                kwargs={"full": full_warmup},
+                args=(engine, ref_audio_bytes, prompt_text, True),
+                kwargs={"full": True},
                 name="fish-tts-kernel-warmup",
                 daemon=True,
-            )
-            warmup_thread.start()
-        else:
-            log.info("Warmup skipped (--fast-start) - first /tts request will "
-                     "be slower than subsequent ones.")
+            ).start()
 
 
 # ---------------------------------------------------------------------------
@@ -968,13 +1058,38 @@ def main() -> int:
     # JIT cost once across all future launches.
     parser.add_argument("--compile", dest="compile_model", action="store_true",
                         default=True,
-                        help="Enable torch.compile() for 2-3x faster inference on CUDA "
-                             "(DEFAULT ON). Adds ~30-90 s to the FIRST launch only "
-                             "(the inductor kernel cache in .torch_cache persists, so "
-                             "every later launch is fast). No effect on CPU/MPS.")
+                        help="Enable torch.compile() for ~2-3x faster inference on CUDA "
+                             "(DEFAULT ON). setup.py installs Triton + the Python dev "
+                             "files it needs, and the server verifies a real generation "
+                             "before committing - if compile can't work on this machine "
+                             "it silently falls back to uncompiled (never silent). The "
+                             "first successful launch compiles (~1-3 min); the cached "
+                             "kernels make later launches fast. No effect on CPU/MPS.")
     parser.add_argument("--no-compile", dest="compile_model", action="store_false",
-                        help="Disable torch.compile(). Use only if compile is failing "
-                             "on this machine - inference will be 2-3x slower on CUDA.")
+                        help="Disable torch.compile() and always run uncompiled.")
+    parser.add_argument("--compile-backend",
+                        choices=["inductor", "cudagraphs", "aot_eager"],
+                        default="inductor",
+                        help="torch.compile backend when --compile is on. "
+                             "'inductor' (DEFAULT) gives the real ~2-3x and "
+                             "compiles ONCE (cached). It needs Triton (setup.py "
+                             "installs triton-windows) and the embeddable Python's "
+                             "headers/libs (setup.py provisions these). "
+                             "'cudagraphs' needs neither but on fish-speech it "
+                             "re-compiles every call and is usually SLOWER here, "
+                             "so only use it if inductor cannot be made to work.")
+    parser.add_argument("--compile-mode",
+                        choices=["default", "reduce-overhead", "none"],
+                        default="default",
+                        help="Inductor-only mode (ignored for the cudagraphs "
+                             "backend). 'default' is robust; 'reduce-overhead' "
+                             "adds CUDA graphs for a little more speed.")
+    parser.add_argument("--self-test", action="store_true", default=False,
+                        help="Load the model (honouring --compile / --compile-mode), "
+                             "run a few timed test generations, print PASS/FAIL + "
+                             "timings, then EXIT without starting the HTTP server. "
+                             "Use this to confirm compile works and measure the "
+                             "speedup before enabling it for gameplay.")
     parser.add_argument("--full-warmup", action="store_true", default=False,
                         help="Run a second, longer warmup pass after model load. "
                              "Only useful when --compile is on; adds ~20 s.")
@@ -994,11 +1109,32 @@ def main() -> int:
                              "the game closes (even if at_exit doesn't fire).")
     args = parser.parse_args()
 
-    # When compile is on (the default on CUDA), pre-warm thoroughly: the second
-    # warmup pass generates a longer sentence so torch.compile specialises the
-    # kernels for realistic Pokedex-entry sequence lengths DURING startup -
-    # i.e. while the player is still walking to the Pokedex - instead of paying
-    # that JIT cost on the first real entry.  Skipped entirely under --fast-start.
+    # Tell the vendored engine which torch.compile backend + mode to use; both
+    # are read in fish_speech/models/text2semantic/inference.py at compile time.
+    os.environ["POKEDEX_VO_COMPILE_BACKEND"] = args.compile_backend
+    os.environ["POKEDEX_VO_COMPILE_MODE"] = args.compile_mode
+
+    # Compile is ON by default and safe (verify-then-commit falls back to
+    # uncompiled if it can't compile here).  To avoid paying a failed-compile
+    # cost on EVERY launch, a machine that already failed to compile drops a
+    # .compile_disabled marker (written after load, below); honour it here and
+    # skip compile until a (re)install clears it or the user forces a retry with
+    # POKEDEX_VO_COMPILE=1.  --self-test always honours the explicit flag.
+    _compile_marker = HERE / ".compile_disabled"
+    _force_compile = os.environ.get("POKEDEX_VO_COMPILE", "") == "1"
+    if (args.compile_model and not _force_compile and not args.self_test
+            and _compile_marker.exists()):
+        log.info("Compile previously failed on this machine (%s present) - running "
+                 "uncompiled this launch. Delete it or re-run setup.py to retry.",
+                 _compile_marker.name)
+        print("[fish-tts] .compile_disabled present (a previous compile failed) - "
+              "running uncompiled. Delete it to retry.", file=sys.stderr)
+        args.compile_model = False
+
+    # When compile is in effect, pre-warm thoroughly: the second warmup pass
+    # generates a longer sentence so torch.compile specialises the kernels for
+    # realistic Pokedex-entry sequence lengths DURING startup - i.e. while the
+    # player is still walking to the Pokedex.  Skipped entirely under --fast-start.
     if args.compile_model and not args.fast_start:
         args.full_warmup = True
 
@@ -1053,6 +1189,57 @@ def main() -> int:
     # for the very first Pokedex entry.  Subsequent entries pick up the
     # cloned voice automatically once warmup finishes.
     # ------------------------------------------------------------------------
+    # ------------------------------------------------------------------------
+    # --self-test: load (honouring --compile), run a few timed generations,
+    # report, and exit WITHOUT binding the socket.  Lets the user verify compile
+    # works + measure the speedup on their own GPU before enabling it in-game.
+    # ------------------------------------------------------------------------
+    if args.self_test:
+        print(f"[fish-tts] SELF-TEST: loading model (compile={args.compile_model}, "
+              f"mode={args.compile_mode})...", file=sys.stderr)
+        ModelHolder.load(args.checkpoint_dir, args.reference_wav, args.reference_txt,
+                         device_override=device, compile_model=args.compile_model,
+                         full_warmup=False, skip_warmup=False)
+        if not _model_state["ready"]:
+            print(f"[fish-tts] SELF-TEST FAILED to load: {_model_state.get('load_error')}",
+                  file=sys.stderr)
+            return 5
+        if args.compile_model and not _model_state.get("compiled"):
+            print(f"[fish-tts] SELF-TEST NOTE: --compile (backend="
+                  f"{args.compile_backend}) was requested but the compiled engine "
+                  f"FAILED verification, so the server fell back to UNCOMPILED.",
+                  file=sys.stderr)
+            note = _model_state.get("compile_note")
+            if note:
+                print(f"[fish-tts] SELF-TEST: compile failure reason => {note}",
+                      file=sys.stderr)
+            print("[fish-tts] SELF-TEST: try a different backend, e.g. "
+                  "  server.py --compile --compile-backend inductor   (needs "
+                  "Triton+cl.exe), or paste the reason above for help.",
+                  file=sys.stderr)
+        sentences = [
+            "This gluttonous Pokemon only assists people with their work because it wants treats.",
+            "It has an extremely sharp sense of direction and can unerringly return home to its nest.",
+            "Ratmander is very skittish and will wave its tail at anything it sees as a threat.",
+        ]
+        times = []
+        for i, sentence in enumerate(sentences, 1):
+            t0 = time.time()
+            try:
+                wav = synthesize(sentence)
+            except Exception as exc:
+                print(f"[fish-tts] SELF-TEST gen {i} FAILED: {exc}", file=sys.stderr)
+                return 6
+            dt = time.time() - t0
+            times.append(dt)
+            print(f"[fish-tts] SELF-TEST gen {i}: {dt:.2f}s ({len(wav)} bytes)",
+                  file=sys.stderr)
+        avg = sum(times) / len(times) if times else 0.0
+        print(f"[fish-tts] SELF-TEST PASS: device={_model_state.get('device')} "
+              f"compiled={_model_state.get('compiled')} "
+              f"avg={avg:.2f}s/sentence over {len(times)} gens.", file=sys.stderr)
+        return 0
+
     global _http_server
     try:
         _http_server = ThreadingHTTPServer((args.host, args.port), TTSHandler)
@@ -1120,9 +1307,28 @@ def main() -> int:
                              full_warmup=args.full_warmup,
                              skip_warmup=args.fast_start)
             if _model_state["ready"]:
+                # Remember the compile outcome so we neither keep paying a failed
+                # compile cost every launch, nor stay disabled once it works.
+                # Only touch the marker when we actually attempted compile.
+                try:
+                    if args.compile_model and not _model_state.get("compiled"):
+                        _compile_marker.write_text(
+                            "torch.compile verification failed on this machine; "
+                            "delete this file (or re-run setup.py) to retry.",
+                            encoding="utf-8")
+                        log.info("Wrote %s - compile will be skipped next launch.",
+                                 _compile_marker.name)
+                    elif _model_state.get("compiled"):
+                        try:
+                            _compile_marker.unlink()
+                        except OSError:
+                            pass
+                except Exception as exc:
+                    log.debug("compile marker update skipped: %s", exc)
                 print(f"[fish-tts] Model READY "
                       f"(device={_model_state['device']}, "
-                      f"api={_model_state['api_version']})",
+                      f"api={_model_state['api_version']}, "
+                      f"compiled={_model_state.get('compiled')})",
                       file=sys.stderr)
             else:
                 print(f"[fish-tts] Model load FAILED: "

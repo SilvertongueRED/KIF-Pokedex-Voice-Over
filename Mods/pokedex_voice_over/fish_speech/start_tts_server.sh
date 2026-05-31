@@ -129,4 +129,11 @@ echo "Loading the model takes ~10-30 seconds on first launch."
 echo "Leave this terminal open while you play.  Ctrl+C to stop."
 echo
 
-exec "$PYCMD" server.py "$@"
+# torch.compile (~2-3x on CUDA) is ON BY DEFAULT in server.py and self-verifies
+# (falls back to uncompiled if it can't compile here, so it cannot silence the
+# mod). To force it OFF, set POKEDEX_VO_COMPILE=0 or create disable_compile.flag.
+COMPILE_ARGS=""
+if [ "${POKEDEX_VO_COMPILE:-}" = "0" ] || [ -f "disable_compile.flag" ]; then
+  COMPILE_ARGS="--no-compile"
+fi
+exec "$PYCMD" server.py $COMPILE_ARGS "$@"
