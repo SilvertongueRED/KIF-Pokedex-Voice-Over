@@ -23,6 +23,7 @@ import argparse
 import os
 import platform
 import shutil
+import time
 import subprocess
 import sys
 from pathlib import Path
@@ -475,19 +476,36 @@ def download_model(token: str | None) -> None:
                 target.unlink()
             except OSError:
                 pass
-        path = hf_hub_download(
-            repo_id=HF_REPO, filename=fname,
-            local_dir=str(CHECKPOINT_DIR),
-            local_dir_use_symlinks=False,
-            token=token,
-        )
-        # huggingface_hub may put the file at a nested path; normalise.
-        if Path(path) != target and Path(path).exists():
-            shutil.move(path, target)
-        if not _checkpoint_is_valid(target, fname):
+        # Network downloads can blip on a ~1.4 GB first-run fetch.
+        # hf_hub_download resumes partial files, so retry a few times before
+        # giving up instead of hard-failing the whole install on one hiccup.
+        last_err = None
+        for attempt in range(1, 4):
+            try:
+                path = hf_hub_download(
+                    repo_id=HF_REPO, filename=fname,
+                    local_dir=str(CHECKPOINT_DIR),
+                    local_dir_use_symlinks=False,
+                    token=token,
+                )
+                # huggingface_hub may put the file at a nested path; normalise.
+                if Path(path) != target and Path(path).exists():
+                    shutil.move(path, target)
+                if _checkpoint_is_valid(target, fname):
+                    last_err = None
+                    break
+                last_err = "downloaded file failed validation"
+            except Exception as exc:  # noqa: BLE001 - retry on any network error
+                last_err = str(exc)
+            if attempt < 3:
+                warn(f"  {fname} download attempt {attempt}/3 failed "
+                     f"({last_err}); retrying in 5s...")
+                time.sleep(5)
+        if last_err is not None or not _checkpoint_is_valid(target, fname):
             err(
                 f"Downloaded {fname} is still not a valid weight file "
-                f"({target.stat().st_size if target.exists() else 0} bytes). "
+                f"({target.stat().st_size if target.exists() else 0} bytes) "
+                f"after 3 attempts. Last error: {last_err}. "
                 f"Verify network access to https://huggingface.co/{HF_REPO}."
             )
             sys.exit(1)
