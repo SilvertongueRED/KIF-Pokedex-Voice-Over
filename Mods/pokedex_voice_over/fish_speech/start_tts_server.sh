@@ -104,6 +104,26 @@ if [[ "$VENV_CREATED" == "1" ]]; then
     rm -f "$INSTALL_MARKER"
 fi
 
+# ---------------------------------------------------------------------------
+# Step 2b: self-heal Git-LFS "stub" weights.
+#
+# A tarball/zip download that did not resolve Git-LFS leaves model.pth / the
+# firefly decoder as ~130-byte pointer stubs instead of the real weights, which
+# crashes the engine ("invalid load key, 'v'").  Delete any stub and clear the
+# .installed marker so setup re-downloads the real weights from HuggingFace.
+# ---------------------------------------------------------------------------
+CKPT="checkpoints/fish-speech-1.5"
+for wf in "$CKPT/model.pth" "$CKPT/firefly-gan-vq-fsq-8x1024-21hz-generator.pth"; do
+    if [[ -f "$wf" ]]; then
+        wsize=$(wc -c < "$wf" 2>/dev/null || echo 0)
+        if [[ "$wsize" -lt 1000000 ]]; then
+            echo "[weights] $(basename "$wf") is only $wsize bytes - a Git-LFS stub, re-downloading the real model."
+            rm -f "$wf"
+            rm -f "$INSTALL_MARKER"
+        fi
+    fi
+done
+
 if [[ ! -f "$INSTALL_MARKER" ]]; then
     echo
     echo "=== First-run setup ==="

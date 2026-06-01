@@ -65,6 +65,28 @@ if not exist "%PYCMD%" (
 :have_python
 
 REM ---------------------------------------------------------------------------
+REM Step 1b: self-heal Git-LFS "stub" weights.
+REM
+REM A GitHub ZIP/tarball download (what a mod manager uses) does NOT resolve
+REM Git-LFS, so model.pth / the firefly decoder can arrive as ~130-byte text
+REM pointer stubs instead of the real 1.4 GB of weights.  Loading a stub crashes
+REM the engine with "invalid load key, 'v'".  Detect any stub here, delete it,
+REM and clear the .installed marker so the first-run setup below re-downloads
+REM the real weights from HuggingFace.
+REM ---------------------------------------------------------------------------
+set "CKPT=checkpoints\fish-speech-1.5"
+for %%F in ("%CKPT%\model.pth" "%CKPT%\firefly-gan-vq-fsq-8x1024-21hz-generator.pth") do (
+    if exist "%%~F" (
+        set "WSIZE=%%~zF"
+        if !WSIZE! LSS 1000000 (
+            echo [weights] %%~nxF is only !WSIZE! bytes - a Git-LFS stub, re-downloading the real model.
+            del /q "%%~F"
+            if exist ".installed" del /q ".installed"
+        )
+    )
+)
+
+REM ---------------------------------------------------------------------------
 REM Step 2: first-run install of torch + fish-speech + model weights.
 REM
 REM We invoke setup.py with the bundled Python so all wheels land in the
