@@ -408,6 +408,47 @@ def install_fish_speech() -> None:
     ok("Inference dependencies installed.")
 
 
+# Git-LFS pointer files are tiny text stubs that GitHub (and any mod manager
+# that downloads a repo as a ZIP/tarball) serves IN PLACE OF the real blob when
+# Git-LFS is not resolved.  They begin with the magic line below.  Loading one
+# as a checkpoint raises "_pickle.UnpicklingError: invalid load key, 'v'"
+# ('v' = the leading "version ..." text).  We must detect and replace them.
+_LFS_POINTER_MAGIC = b"version https://git-lfs.github.com/spec/v1"
+
+# Minimum plausible byte size for the large weight blobs.  Anything far below
+# this (a ~130-byte LFS stub, or a truncated download) is not the real file and
+# must be re-fetched from HuggingFace.
+_MIN_CHECKPOINT_BYTES = {
+    "firefly-gan-vq-fsq-8x1024-21hz-generator.pth": 100_000_000,  # real ~188 MB
+    "model.pth": 1_000_000_000,                                   # real ~1.27 GB
+}
+
+
+def _checkpoint_is_valid(target: Path, fname: str) -> bool:
+    """True only if *target* is the real weight file, not a Git-LFS pointer
+    stub, a truncated download, or an empty placeholder."""
+    if not target.exists():
+        return False
+    try:
+        size = target.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    # Reject Git-LFS pointer stubs (and any other tiny text masquerade).
+    try:
+        with open(target, "rb") as fh:
+            if fh.read(len(_LFS_POINTER_MAGIC)) == _LFS_POINTER_MAGIC:
+                return False
+    except OSError:
+        return False
+    # Enforce a sane floor for the big binary blobs (catches truncated files
+    # that are not pointer stubs).
+    if size < _MIN_CHECKPOINT_BYTES.get(fname, 1):
+        return False
+    return True
+
+
 def download_model(token: str | None) -> None:
     info(f"Downloading model weights to {CHECKPOINT_DIR}")
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -420,10 +461,20 @@ def download_model(token: str | None) -> None:
 
     for fname in HF_FILES:
         target = CHECKPOINT_DIR / fname
-        if target.exists() and target.stat().st_size > 0:
+        if _checkpoint_is_valid(target, fname):
             ok(f"  ✓ {fname} (cached)")
             continue
         info(f"  ⤓ {fname}")
+        if target.exists():
+            warn(
+                f"  {fname} is a Git-LFS stub / truncated "
+                f"({target.stat().st_size} bytes); fetching the real weights "
+                f"from HuggingFace"
+            )
+            try:
+                target.unlink()
+            except OSError:
+                pass
         path = hf_hub_download(
             repo_id=HF_REPO, filename=fname,
             local_dir=str(CHECKPOINT_DIR),
@@ -433,6 +484,13 @@ def download_model(token: str | None) -> None:
         # huggingface_hub may put the file at a nested path; normalise.
         if Path(path) != target and Path(path).exists():
             shutil.move(path, target)
+        if not _checkpoint_is_valid(target, fname):
+            err(
+                f"Downloaded {fname} is still not a valid weight file "
+                f"({target.stat().st_size if target.exists() else 0} bytes). "
+                f"Verify network access to https://huggingface.co/{HF_REPO}."
+            )
+            sys.exit(1)
     ok("Model weights ready.")
 
 
@@ -690,6 +748,10 @@ def main() -> int:
             return 1
         if not CHECKPOINT_DIR.exists():
             err(f"Checkpoint dir missing: {CHECKPOINT_DIR}")
+            return 1
+        bad = [f for f in HF_FILES if not _checkpoint_is_valid(CHECKPOINT_DIR / f, f)]
+        if bad:
+            err(f"Invalid / Git-LFS-stub checkpoint files: {', '.join(bad)}")
             return 1
         ok("Install looks good.")
         return 0

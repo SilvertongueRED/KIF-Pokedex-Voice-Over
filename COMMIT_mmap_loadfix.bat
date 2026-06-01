@@ -20,6 +20,7 @@ cd /d "%~dp0"
 echo Staging changed files...
 git add Mods/pokedex_voice_over/fish_speech/vendor/fish_speech/models/text2semantic/llama.py
 git add Mods/pokedex_voice_over/fish_speech/vendor/fish_speech/models/vqgan/inference.py
+git add Mods/pokedex_voice_over/fish_speech/setup.py
 git add Mods/pokedex_voice_over/main.rb
 
 echo.
@@ -27,7 +28,7 @@ git status --short
 echo.
 
 echo Committing...
-git commit -m "Fix launch crash: non-mmap + weights_only=False load for legacy fish-speech-1.5 checkpoints; Ruby 3.1-safe ReadTimeout"
+git commit -m "Fix launch crash: auto-replace Git-LFS checkpoint stubs in setup.py; non-mmap + weights_only=False load for legacy fish-speech-1.5 checkpoints; Ruby 3.1-safe ReadTimeout"
 echo.
 
 echo Done. Review the log above, then run:  git push
