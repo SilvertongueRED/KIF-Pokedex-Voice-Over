@@ -421,12 +421,29 @@ class BaseTransformer(nn.Module):
                 simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
                 model = simple_quantizer.convert_for_runtime()
 
-            weights = torch.load(
-                Path(path) / "model.pth",
-                map_location="cpu",
-                mmap=True,
-                weights_only=True,
-            )
+            try:
+                weights = torch.load(
+                    Path(path) / "model.pth",
+                    map_location="cpu",
+                    mmap=True,
+                    weights_only=True,
+                )
+            except (RuntimeError, ValueError) as mmap_exc:
+                # Checkpoints saved in the legacy (non-zipfile) torch format
+                # cannot be memory-mapped -- torch raises:
+                #   "mmap can only be used with files saved with
+                #    torch.save(_use_new_zipfile_serialization=True)".
+                # Fall back to a normal (non-mmap) load so the engine works
+                # offline regardless of how model.pth was serialized.
+                logger.warning(
+                    f"mmap load failed ({mmap_exc}); retrying without mmap"
+                )
+                weights = torch.load(
+                    Path(path) / "model.pth",
+                    map_location="cpu",
+                    mmap=False,
+                    weights_only=True,
+                )
 
             if "state_dict" in weights:
                 logger.warning(

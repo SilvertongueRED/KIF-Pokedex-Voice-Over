@@ -32,6 +32,9 @@ Mods/pokedex_voice_over/fish_speech/=*
 # Backup zips occasionally left behind by KIF's mod manager
 Mods/PreModManager*.zip
 
+# Stray probe file (safe to delete)
+.cowork_write_probe
+
 # Editor / OS junk
 .DS_Store
 Thumbs.db

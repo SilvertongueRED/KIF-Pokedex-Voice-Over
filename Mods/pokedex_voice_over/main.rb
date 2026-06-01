@@ -535,14 +535,22 @@ module PokedexVoiceOver
     end
   end
 
-  # Read at most max_bytes from sock, raising IO::TimeoutError if the
+  # Raised when a bounded socket read exceeds its wall-clock budget.
+  # NOTE: we define our own error class instead of using IO::TimeoutError,
+  # which only exists in Ruby 3.2+.  MKXP-Z ships Ruby 3.1.3, where
+  # referencing IO::TimeoutError raises NameError (uninitialized constant) —
+  # that turned every legitimate /tts read timeout into an unhandled crash
+  # that aborted synthesis ("uninitialized constant IO::TimeoutError").
+  class ReadTimeout < StandardError; end
+
+  # Read at most max_bytes from sock, raising ReadTimeout if the
   # connection produces no data for more than read_timeout seconds.
   # Returns the bytes read so far if the peer closes cleanly.
   def self._read_bounded(sock, max_bytes, read_timeout)
     buf = "".force_encoding("BINARY")
     loop do
       ready = IO.select([sock], nil, nil, read_timeout)
-      raise IO::TimeoutError, "read timed out after #{read_timeout}s" if ready.nil?
+      raise ReadTimeout, "read timed out after #{read_timeout}s" if ready.nil?
       begin
         chunk = sock.read_nonblock(64 * 1024, exception: false)
       rescue EOFError
