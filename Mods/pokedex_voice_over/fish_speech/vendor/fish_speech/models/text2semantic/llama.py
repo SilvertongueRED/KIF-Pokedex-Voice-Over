@@ -426,9 +426,9 @@ class BaseTransformer(nn.Module):
                     Path(path) / "model.pth",
                     map_location="cpu",
                     mmap=True,
-                    weights_only=True,
+                    weights_only=False,
                 )
-            except (RuntimeError, ValueError) as mmap_exc:
+            except Exception as mmap_exc:
                 # Checkpoints saved in the legacy (non-zipfile) torch format
                 # cannot be memory-mapped -- torch raises:
                 #   "mmap can only be used with files saved with
@@ -442,7 +442,7 @@ class BaseTransformer(nn.Module):
                     Path(path) / "model.pth",
                     map_location="cpu",
                     mmap=False,
-                    weights_only=True,
+                    weights_only=False,
                 )
 
             if "state_dict" in weights:

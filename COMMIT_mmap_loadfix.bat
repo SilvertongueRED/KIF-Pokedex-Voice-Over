@@ -6,7 +6,10 @@ REM  Fixes the runtime crash on game launch:
 REM    "RuntimeError: mmap can only be used with files saved with
 REM     torch.save(_use_new_zipfile_serialization=True)"
 REM  by making the vendored engine fall back to a non-mmap load
-REM  when model.pth is a legacy (non-zipfile) checkpoint, and
+REM  when model.pth is a legacy (non-zipfile) checkpoint AND
+REM  loading both checkpoints with weights_only=False (the
+REM  legacy fish-speech-1.5 .pth files cannot be unpickled in
+REM  torch 2.5's weights_only mode -> UnpicklingError), and
 REM  replaces the Ruby 3.2-only IO::TimeoutError (which crashed
 REM  on MKXP-Z's Ruby 3.1.3) with a self-defined ReadTimeout.
 REM
@@ -24,7 +27,7 @@ git status --short
 echo.
 
 echo Committing...
-git commit -m "Fix launch crash: non-mmap fallback for legacy model.pth; Ruby 3.1-safe ReadTimeout (replaces IO::TimeoutError)"
+git commit -m "Fix launch crash: non-mmap + weights_only=False load for legacy fish-speech-1.5 checkpoints; Ruby 3.1-safe ReadTimeout"
 echo.
 
 echo Done. Review the log above, then run:  git push
