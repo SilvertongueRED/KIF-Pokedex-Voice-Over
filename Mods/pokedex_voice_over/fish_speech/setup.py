@@ -197,21 +197,53 @@ def _pip_has_distribution(dist_name: str) -> bool:
         return False
 
 
-def _vendor_is_present() -> bool:
-    """Sanity-check that the vendored 1.5 engine actually shipped with the mod.
+VENDOR_MARKER = VENDOR_DIR / ".project-root"
 
-    We verify the exact file the 1.5 checkpoint depends on
-    (fsq.py, holding DownsampleFiniteScalarQuantize) plus the Hydra config dir
-    and the .project-root marker pyrootutils needs, so a truncated copy fails
-    loudly here instead of deep inside model load.
+
+def _vendor_core_files() -> list[Path]:
+    """Real engine code/config that setup CANNOT regenerate offline.
+
+    These are the files the 1.5 checkpoint depends on - fsq.py (holding
+    DownsampleFiniteScalarQuantize), the Hydra config, and the inference_engine
+    package - so they MUST physically ship inside ./vendor.  If any are absent
+    the mod was not extracted/copied in full and we cannot fix it here.
     """
-    needed = [
+    return [
         VENDOR_DIR / "fish_speech" / "models" / "vqgan" / "modules" / "fsq.py",
         VENDOR_DIR / "fish_speech" / "configs" / "firefly_gan_vq.yaml",
         VENDOR_DIR / "fish_speech" / "inference_engine" / "__init__.py",
-        VENDOR_DIR / ".project-root",
     ]
-    return all(p.exists() for p in needed)
+
+
+def _ensure_vendor_marker() -> None:
+    """Recreate ./vendor/.project-root if only that marker got dropped.
+
+    .project-root is an EMPTY hidden file pyrootutils uses to locate the project
+    root - only its existence matters.  Hidden dotfiles are exactly what naive
+    zip extraction, file-by-file mod-manager downloads, and OneDrive sync skip,
+    so when the real engine code is present we silently restore the marker
+    instead of making the user re-extract the entire mod.
+    """
+    if VENDOR_MARKER.exists():
+        return
+    if all(p.exists() for p in _vendor_core_files()):
+        try:
+            VENDOR_MARKER.write_text("", encoding="utf-8")
+            warn("Restored missing vendor marker .project-root (it was dropped "
+                 "in distribution; the engine code itself is present).")
+        except Exception as exc:
+            warn(f"Could not recreate {VENDOR_MARKER} ({exc}).")
+
+
+def _vendor_missing_files() -> list[Path]:
+    """Return any required vendored-engine files that are absent."""
+    return [p for p in (_vendor_core_files() + [VENDOR_MARKER]) if not p.exists()]
+
+
+def _vendor_is_present() -> bool:
+    """Sanity-check that the vendored 1.5 engine actually shipped with the mod,
+    so a truncated copy fails loudly here instead of deep inside model load."""
+    return not _vendor_missing_files()
 
 
 # ---------------------------------------------------------------------------
@@ -407,9 +439,17 @@ def install_fish_speech() -> None:
 
     Re-runs are smart: a no-op when the key leaf packages already import.
     """
-    if not _vendor_is_present():
-        err(f"Vendored fish-speech engine missing/incomplete under {VENDOR_DIR}. "
-            f"Re-extract the mod - ./vendor must ship with it.")
+    # Self-heal a dropped .project-root marker before failing (the engine code
+    # may be fully present and only the hidden marker got skipped in transit).
+    _ensure_vendor_marker()
+    missing = _vendor_missing_files()
+    if missing:
+        err(f"Vendored fish-speech engine missing/incomplete under {VENDOR_DIR}.")
+        for _p in missing:
+            err(f"  missing: {_p.relative_to(VENDOR_DIR)}")
+        err("Re-extract / re-copy the mod so ./vendor ships in FULL - make sure "
+            "hidden files like .project-root are included (some unzip tools and "
+            "mod managers skip dotfiles).")
         sys.exit(1)
 
     # A stale pip-installed fish-speech (e.g. a 2.x left by an older setup.py)
