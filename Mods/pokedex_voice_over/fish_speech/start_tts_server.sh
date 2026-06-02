@@ -21,6 +21,12 @@ set -uo pipefail
 
 cd "$(dirname "$0")"
 
+# Force UTF-8 stdio so Python never crashes printing non-ASCII glyphs when its
+# output is captured to setup.log (a redirected pipe rather than a console).
+# Mirrors the Windows launcher; a harmless no-op on the usual UTF-8 locale.
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 # ---------------------------------------------------------------------------
 # Step 1: locate a system Python to bootstrap the virtual environment from.
 #

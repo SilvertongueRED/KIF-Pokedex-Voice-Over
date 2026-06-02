@@ -28,6 +28,24 @@ import subprocess
 import sys
 from pathlib import Path
 
+# ---------------------------------------------------------------------------
+# Force UTF-8 stdio (IMPORTANT - prevents a first-run install crash)
+# ---------------------------------------------------------------------------
+# setup.py prints a few non-ASCII glyphs (e.g. the "downloading" arrow in
+# download_model).  When the launcher captures setup output to setup.log the
+# child's stdout is a redirected PIPE, not a console, so Python falls back to
+# the legacy Windows codepage (cp1252) which cannot encode those glyphs - the
+# bare print() then raises UnicodeEncodeError and aborts the whole install
+# before the model is even downloaded (so .installed is never written and the
+# server never starts).  Reconfiguring to UTF-8 with errors="replace" makes
+# every print safe no matter how stdout is connected, and is a harmless no-op
+# when stdout is already UTF-8.  (The launchers also set PYTHONUTF8=1.)
+for _std in (sys.stdout, sys.stderr):
+    try:
+        _std.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 HERE = Path(__file__).resolve().parent
 REFERENCE_DIR = HERE / "reference"
 REFERENCE_WAV = REFERENCE_DIR / "voice.wav"
@@ -119,7 +137,18 @@ def detect_cuda() -> bool:
 
 
 def run_pip(args: list[str]) -> None:
-    cmd = [sys.executable, "-m", "pip", "install"] + args
+    # --no-warn-script-location suppresses pip's "WARNING: The script X is
+    # installed in '...\\Scripts' which is not on PATH" messages.  Those print
+    # in alarming red during a normal install, but they are harmless *for this
+    # mod*: the bundled embeddable Python is private to the mod folder and
+    # nothing here ever calls those console scripts by bare name (server.py
+    # imports the libraries directly), so Scripts/ being off PATH does not
+    # matter.  The flag is scoped to THIS single pip invocation only - it does
+    # not touch the user's global pip config, environment, or any unrelated
+    # terminal/pip usage outside the mod.  (install_python.bat passes the same
+    # flag to get-pip for exactly this reason.)
+    cmd = [sys.executable, "-m", "pip", "install",
+           "--no-warn-script-location"] + args
     info("$ " + " ".join(cmd))
     subprocess.check_call(cmd)
 

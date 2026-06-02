@@ -22,6 +22,17 @@ title FishSpeechTTS
 cd /d "%~dp0"
 
 REM ---------------------------------------------------------------------------
+REM Force UTF-8 for Python's stdout/stderr.  Without this, when setup.py's
+REM output is captured to setup.log (a redirected pipe, not a console) Python
+REM falls back to the legacy cp1252 codepage and CRASHES the first time it
+REM prints a non-ASCII glyph (e.g. the download arrow) -> the install aborts
+REM before the model downloads and .installed is never written.  This also
+REM keeps setup.log / server output clean.  Scoped to this process only.
+REM ---------------------------------------------------------------------------
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
+
+REM ---------------------------------------------------------------------------
 REM Step 1: locate Python.
 REM
 REM Hard preference for the *bundled* embeddable interpreter at
