@@ -452,12 +452,61 @@ def install_fish_speech() -> None:
     _ensure_vendor_marker()
     missing = _vendor_missing_files()
     if missing:
-        err(f"Vendored fish-speech engine missing/incomplete under {VENDOR_DIR}.")
-        for _p in missing:
-            err(f"  missing: {_p.relative_to(VENDOR_DIR)}")
-        err("Re-extract / re-copy the mod so ./vendor ships in FULL - make sure "
-            "hidden files like .project-root are included (some unzip tools and "
-            "mod managers skip dotfiles).")
+        # Plain-language, step-by-step guidance: most users who hit this are
+        # players whose unzip tool / mod-manager / cloud-sync silently dropped
+        # some engine files.  We cannot regenerate the engine offline, but we
+        # can tell them exactly how to get a complete copy back.
+        err("the mod's offline voice engine is incomplete - setup can't continue.")
+        _bar = "=" * 68
+        _lines = [
+            "",
+            _bar,
+            "  MISSING VOICE-ENGINE FILES",
+            _bar,
+            "",
+            "The offline voice engine ships inside the mod at:",
+            f"    {VENDOR_DIR}",
+            "",
+            "but these required file(s) did not arrive with your copy:",
+        ]
+        _lines += [f"    - {p.relative_to(VENDOR_DIR)}" for p in missing]
+        _lines += [
+            "",
+            "This almost always means the mod was unzipped or copied with a tool",
+            "that silently skipped some files - most often hidden files like",
+            "'.project-root', or files left 'online-only' by OneDrive / cloud sync.",
+            "Your PC is fine; the files just need to be put back.",
+            "",
+            "HOW TO FIX (try in order):",
+            "",
+            "  1. Download a FRESH, COMPLETE copy of the mod from the official",
+            "     source:",
+            "       https://github.com/SilvertongueRED/KIF-Pokedex-Voice-Over",
+            "     Use the full 'Code > Download ZIP' (or a release ZIP) - not a",
+            "     partial or hand-picked copy.",
+            "",
+            "  2. Unzip it with Windows Explorer's built-in 'Extract All', or with",
+            "     7-Zip.  Don't drag out files one at a time, and don't copy the",
+            "     folder while it is still downloading.",
+            "",
+            "  3. Before copying, turn on  File Explorer > View > Show > Hidden",
+            "     items  so hidden files (like '.project-root') come along too.",
+            "",
+            "  4. Copy the ENTIRE 'pokedex_voice_over' folder into the game's",
+            "     'Mods' folder, replacing the old one, so that the",
+            "     'fish_speech\\vendor' folder is complete.",
+            "",
+            "  5. If the mod lives in OneDrive / Dropbox / Google Drive, right-click",
+            "     the mod folder and choose 'Always keep on this device', wait for",
+            "     it to finish downloading every file, then try again.",
+            "",
+            "Then just relaunch the game (or re-run this setup) - nothing else is",
+            "needed.  A full copy of this log is saved next to this script as",
+            "'setup.log'.",
+            _bar,
+            "",
+        ]
+        print("\n".join(_lines), file=sys.stderr)
         sys.exit(1)
 
     # A stale pip-installed fish-speech (e.g. a 2.x left by an older setup.py)
