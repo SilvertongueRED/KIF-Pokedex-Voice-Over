@@ -43,11 +43,19 @@ import signal
 import sys
 import threading
 import time
+import warnings
 import wave
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qs
+
+# Suppress FutureWarnings from third-party packages (vector_quantize_pytorch,
+# torch sdp_kernel).  These are cosmetic deprecation notices — the code works
+# fine — but they appear in red in server.log and alarm users.
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"vector_quantize_pytorch")
+warnings.filterwarnings("ignore", message=r".*torch\.cuda\.amp\.autocast.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=r".*sdp_kernel.*", category=FutureWarning)
 
 HERE = Path(__file__).resolve().parent
 DEFAULT_REF_WAV = HERE / "reference" / "voice.wav"

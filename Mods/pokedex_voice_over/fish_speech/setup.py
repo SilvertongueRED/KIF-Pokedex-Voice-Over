@@ -26,7 +26,15 @@ import shutil
 import time
 import subprocess
 import sys
+import warnings
 from pathlib import Path
+
+# Suppress deprecation warnings from third-party packages (torch / vector_quantize_pytorch).
+# These are cosmetic — the functionality is unaffected — but they print in red
+# and confuse users who see them in setup.log.
+warnings.filterwarnings("ignore", category=FutureWarning, module=r"vector_quantize_pytorch")
+warnings.filterwarnings("ignore", message=r".*torch\.cuda\.amp\.autocast.*", category=FutureWarning)
+warnings.filterwarnings("ignore", message=r".*sdp_kernel.*", category=FutureWarning)
 
 # ---------------------------------------------------------------------------
 # Force UTF-8 stdio (IMPORTANT - prevents a first-run install crash)
@@ -554,7 +562,6 @@ def download_model(token: str | None) -> None:
                 path = hf_hub_download(
                     repo_id=HF_REPO, filename=fname,
                     local_dir=str(CHECKPOINT_DIR),
-                    local_dir_use_symlinks=False,
                     token=token,
                 )
                 # huggingface_hub may put the file at a nested path; normalise.
