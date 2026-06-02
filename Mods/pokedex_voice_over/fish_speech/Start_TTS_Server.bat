@@ -123,7 +123,7 @@ if not exist "%INSTALL_MARKER%" (
         REM to setup.log so a first-run failure stays diagnosable after the
         REM window closes.  Relative paths keep PowerShell quoting safe even when
         REM the game path has spaces/parens/apostrophes (e.g. "Kuray's ... (KIF)").
-        powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\python\python.exe' '.\setup.py' 2>&1 | Tee-Object -FilePath '.\setup.log'; exit $LASTEXITCODE"
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "cmd /c '.\python\python.exe .\setup.py 2>&1' | Tee-Object -FilePath '.\setup.log'; exit $LASTEXITCODE"
     )
     if !ERRORLEVEL!==0 (
         echo. > "%INSTALL_MARKER%"

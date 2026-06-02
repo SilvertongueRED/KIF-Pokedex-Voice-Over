@@ -527,6 +527,39 @@ def _checkpoint_is_valid(target: Path, fname: str) -> bool:
     return True
 
 
+def ensure_hf_xet() -> None:
+    """Best-effort install of the optional `hf_xet` accelerator.
+
+    fishaudio/fish-speech-1.5 is hosted on HuggingFace's Xet storage backend.
+    With `hf_xet` present, huggingface_hub fetches the ~1.4 GB of weights over
+    the Xet protocol (chunk-deduplicated, parallel, resumable) instead of a
+    single plain-HTTPS stream - a faster, sturdier one-time download.  When it
+    is absent, huggingface_hub prints a (harmless) warning and falls back to
+    regular HTTP, which still works fine.
+
+    This is therefore PURELY a download-speed nicety and must never be allowed
+    to break setup: we try to install it, and if the wheel is unavailable for
+    this platform / Python, or the install errors for any reason, we simply
+    carry on with the HTTP fallback.  hf_xet plays no part in offline operation
+    - once the weights are cached it is irrelevant.
+    """
+    if _module_importable("hf_xet"):
+        ok("hf_xet present - HuggingFace downloads use the Xet fast path.")
+        return
+    info("Installing optional hf_xet (speeds up the one-time model download)...")
+    # subprocess.call (NOT check_call): a failure here is non-fatal by design.
+    rc = subprocess.call(
+        [sys.executable, "-m", "pip", "install",
+         "--no-warn-script-location", "hf_xet"]
+    )
+    if rc == 0 and _module_importable("hf_xet"):
+        ok("hf_xet installed - HuggingFace downloads use the Xet fast path.")
+    else:
+        warn("Could not install hf_xet (optional) - the model will download "
+             "over regular HTTP instead.  This is harmless; it is only a "
+             "download-speed optimisation and does not affect offline use.")
+
+
 def download_model(token: str | None) -> None:
     info(f"Downloading model weights to {CHECKPOINT_DIR}")
     CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
@@ -876,6 +909,9 @@ def main() -> int:
             pass
 
     if not args.skip_download:
+        # Best-effort: enable HuggingFace's Xet fast-download path if we can.
+        # Never fatal - falls back to plain HTTP (see ensure_hf_xet).
+        ensure_hf_xet()
         download_model(args.hf_token)
 
     prepare_reference(args.reference)

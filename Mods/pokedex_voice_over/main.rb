@@ -789,11 +789,13 @@ module PokedexVoiceOver
         # before — without an explicit title, start would use the bat path
         # itself as the title and then have no program to launch).
         launcher_win = launcher_abs.gsub('/', '\\')
-        # Show the window (not /MIN) during the one-time first-run install
-        # so the player sees download progress and any setup error;
-        # minimise only once installed, for quiet normal play.
-        first_run = !FileTest.exist?("#{FISH_SPEECH_DIR}/.installed")
-        min_flag = (debug_spawn || first_run) ? "" : "/MIN "
+        # Always start the window MINIMISED, but never hidden: it stays in
+        # the taskbar so a curious player can click it open to watch first-run
+        # download progress or setup output, but it never steals focus or
+        # covers the game.  The full first-run transcript is still saved to
+        # fish_speech/setup.log for diagnosis even if the window is never
+        # opened.  POKEDEX_VO_DEBUG_SPAWN=1 forces a normal visible window.
+        min_flag = debug_spawn ? "" : "/MIN "
         spawn_cmd = %Q{start "FishSpeechTTS" #{min_flag}"#{launcher_win}" #{parent_pid_arg}}
         log("  fish-speech autostart: cmdline => #{spawn_cmd}")
         ok = system(spawn_cmd)

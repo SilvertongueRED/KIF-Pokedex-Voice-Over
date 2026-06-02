@@ -44,6 +44,11 @@ soundfile>=0.12
 # librosa removed: reference resampling now uses torchaudio
 # (avoids numba/llvmlite/scipy, ~250 MB).  See setup.py prepare_reference().
 huggingface_hub>=0.23              # setup.py uses it to download the model weights
+# hf_xet is installed BEST-EFFORT by setup.py (ensure_hf_xet), NOT from this
+# file, so a missing wheel can never abort the install.  It enables HuggingFace's
+# Xet fast-download path for the one-time ~1.4 GB weight fetch; without it the
+# download falls back to plain HTTP (harmless).  Listed here for documentation.
+# hf_xet                            # optional Xet accelerator - see setup.py
 loguru>=0.6.0
 natsort>=8.4.0
 tqdm>=4.62
