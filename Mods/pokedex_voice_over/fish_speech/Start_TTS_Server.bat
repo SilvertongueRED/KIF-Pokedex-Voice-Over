@@ -102,13 +102,27 @@ if not exist "%INSTALL_MARKER%" (
     echo This is a one-time step.  Re-runs skip straight to the server.
     echo The model weights are ~1.4 GB - the download takes a few minutes.
     echo.
-    "%PYCMD%" setup.py
+    echo A full transcript of this setup is saved to  fish_speech\setup.log
+    echo.
+    if defined POKEDEX_VO_PYTHON (
+        REM Advanced override interpreter: run directly.
+        "%PYCMD%" setup.py
+    ) else (
+        REM Bundled Python: tee the WHOLE transcript (python prints + pip output)
+        REM to setup.log so a first-run failure stays diagnosable after the
+        REM window closes.  Relative paths keep PowerShell quoting safe even when
+        REM the game path has spaces/parens/apostrophes (e.g. "Kuray's ... (KIF)").
+        powershell -NoProfile -ExecutionPolicy Bypass -Command "& '.\python\python.exe' '.\setup.py' 2>&1 | Tee-Object -FilePath '.\setup.log'; exit $LASTEXITCODE"
+    )
     if !ERRORLEVEL!==0 (
         echo. > "%INSTALL_MARKER%"
     ) else (
         echo.
-        echo Setup failed.  Re-run this script after fixing the error above,
-        echo or run  "%PYCMD%" setup.py  manually to see the full output.
+        echo Setup failed.  Full transcript:
+        echo     %~dp0setup.log
+        echo Re-run this script after fixing the error above, or run
+        echo     "%PYCMD%" setup.py
+        echo manually to see the full output.
         echo.
         pause
         exit /b 1

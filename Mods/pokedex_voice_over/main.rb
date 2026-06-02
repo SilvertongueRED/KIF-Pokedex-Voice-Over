@@ -130,6 +130,13 @@ module PokedexVoiceOver
   # self-heal after an idle-timeout/crash without launching a storm of
   # launcher windows while it is still loading.
   FISH_SPEECH_AUTOSTART_RETRY_SECS = 30.0
+  # First-run setup (install torch + fish-speech + download the ~1.4 GB
+  # model) legitimately takes several minutes.  While it runs (.installed
+  # absent) we must NOT re-spawn the launcher on the normal 30 s cadence,
+  # or a second setup.py would pip-install into the same python\ folder
+  # concurrently and corrupt it.  Pace first-run respawns far apart; the
+  # normal cadence resumes automatically once .installed exists.
+  FISH_SPEECH_FIRSTRUN_RETRY_SECS = 900.0
   # When the sidecar is known-DOWN, re-poll /health this often (seconds)
   # instead of caching the "down" verdict for the full positive-result
   # minute, so a freshly auto-restarted server is picked up promptly.
@@ -733,8 +740,13 @@ module PokedexVoiceOver
     # the next entry without spawning a storm of launcher windows while
     # it loads.
     now = Time.now.to_f
+    # While first-run setup is still installing (.installed absent) use a
+    # much longer retry gap so we don't launch a second, colliding setup.py.
+    fs_installed = FileTest.exist?("#{FISH_SPEECH_DIR}/.installed")
+    retry_secs = fs_installed ? FISH_SPEECH_AUTOSTART_RETRY_SECS
+                              : FISH_SPEECH_FIRSTRUN_RETRY_SECS
     if defined?(@fish_speech_autostart_at) && @fish_speech_autostart_at &&
-       (now - @fish_speech_autostart_at) < FISH_SPEECH_AUTOSTART_RETRY_SECS
+       (now - @fish_speech_autostart_at) < retry_secs
       return
     end
     @fish_speech_autostart_at = now
@@ -777,7 +789,11 @@ module PokedexVoiceOver
         # before — without an explicit title, start would use the bat path
         # itself as the title and then have no program to launch).
         launcher_win = launcher_abs.gsub('/', '\\')
-        min_flag = debug_spawn ? "" : "/MIN "
+        # Show the window (not /MIN) during the one-time first-run install
+        # so the player sees download progress and any setup error;
+        # minimise only once installed, for quiet normal play.
+        first_run = !FileTest.exist?("#{FISH_SPEECH_DIR}/.installed")
+        min_flag = (debug_spawn || first_run) ? "" : "/MIN "
         spawn_cmd = %Q{start "FishSpeechTTS" #{min_flag}"#{launcher_win}" #{parent_pid_arg}}
         log("  fish-speech autostart: cmdline => #{spawn_cmd}")
         ok = system(spawn_cmd)

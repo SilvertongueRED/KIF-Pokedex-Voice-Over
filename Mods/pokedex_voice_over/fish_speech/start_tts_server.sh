@@ -131,11 +131,17 @@ if [[ ! -f "$INSTALL_MARKER" ]]; then
     echo "This is a one-time step.  Re-runs skip straight to the server."
     echo "The model weights are ~1.4 GB - the download takes a few minutes."
     echo
-    if "$PYCMD" setup.py; then
+    # Tee the whole transcript to setup.log so first-run failures stay
+    # diagnosable; PIPESTATUS[0] preserves setup.py's real exit code.
+    echo "A full transcript is saved to  fish_speech/setup.log"
+    echo
+    "$PYCMD" setup.py 2>&1 | tee setup.log
+    if [[ ${PIPESTATUS[0]} -eq 0 ]]; then
         touch "$INSTALL_MARKER"
     else
         echo
-        echo "Setup failed.  Re-run this script after fixing the error above," >&2
+        echo "Setup failed.  Full transcript: fish_speech/setup.log" >&2
+        echo "Re-run this script after fixing the error above," >&2
         echo "or run \"$PYCMD setup.py\" manually to see the full output." >&2
         exit 1
     fi
