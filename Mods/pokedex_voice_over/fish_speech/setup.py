@@ -899,28 +899,55 @@ def slim_install() -> None:
 # Parallel download helper + optional quantization
 # ---------------------------------------------------------------------------
 
-def _ensure_downloader_deps() -> bool:
-    """Make sure huggingface_hub (and, best-effort, hf_xet) are importable so the
-    ~1.4 GB weights download can run on a background thread IN PARALLEL with the
-    heavy torch/deps install.
+def _prefetch_weights_urllib() -> None:
+    """Best-effort background prefetch of the large weight blobs using ONLY the
+    Python standard library (urllib).
 
-    Returns True only if huggingface_hub is importable afterwards (i.e. the
-    parallel download is safe to start).  We install it in the FOREGROUND here:
-    the background thread must never run pip, because two concurrent pip
-    processes can corrupt the shared site-packages.
+    CRITICAL: this must NOT import huggingface_hub (or any other pip-managed
+    package) into this process.  The foreground install can upgrade/downgrade
+    huggingface_hub while this runs; if we imported it here, the stale module
+    cached in this long-lived setup process would later break the in-process
+    smoke test with "cannot import name 'HfFolder' from huggingface_hub.utils".
+    urllib is stdlib, so it is immune.  download_model() runs AFTER every pip
+    install has settled and validates/fetches anything this misses, so any
+    failure here is harmless - we simply fall back to that.
     """
-    if not _module_importable("huggingface_hub"):
-        info("Pre-installing huggingface_hub so the model download can overlap "
-             "the torch install...")
-        try:
-            run_pip(["huggingface_hub>=0.23"])
-        except Exception as exc:  # noqa: BLE001
-            warn(f"Could not pre-install huggingface_hub ({exc}); the model "
-                 f"download will run sequentially after the deps install.")
-            return False
-    # hf_xet is a pure download-speed nicety; safe to install in the foreground.
-    ensure_hf_xet()
-    return _module_importable("huggingface_hub")
+    import urllib.request
+    try:
+        CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        return
+    # Only the two large blobs are worth overlapping; the tiny config/tokenizer
+    # files download in a blink via download_model afterwards.
+    big = ["firefly-gan-vq-fsq-8x1024-21hz-generator.pth", "model.pth"]
+    for fname in big:
+        target = CHECKPOINT_DIR / fname
+        if _checkpoint_is_valid(target, fname):
+            continue
+        url = f"https://huggingface.co/{HF_REPO}/resolve/main/{fname}?download=true"
+        tmp = target.with_suffix(target.suffix + ".part")
+        for attempt in range(1, 3):
+            try:
+                req = urllib.request.Request(
+                    url, headers={"User-Agent": "kif-pokedex-voiceover/1.0"})
+                with urllib.request.urlopen(req, timeout=120) as resp, \
+                        open(tmp, "wb") as fh:
+                    while True:
+                        chunk = resp.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        fh.write(chunk)
+                tmp.replace(target)
+                if _checkpoint_is_valid(target, fname):
+                    info(f"  prefetched {fname} (background)")
+                    break
+            except Exception:  # noqa: BLE001 - best effort; download_model recovers
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                if attempt < 2:
+                    time.sleep(3)
 
 
 def quantize_model(mode: str) -> None:
@@ -1054,30 +1081,24 @@ def main() -> int:
 
     # ------------------------------------------------------------------------
     # Overlap the ~1.4 GB weights download with the heavy torch/deps install.
-    # Both are network/disk bound and independent, so we kick the model
-    # download off on a background THREAD while pip installs torch in the
-    # foreground - hiding most of the download time.  The thread only DOWNLOADS
-    # (huggingface_hub), never runs pip, because two concurrent pip processes
-    # can corrupt the shared site-packages.  Requires huggingface_hub up front
-    # (installed in the foreground by _ensure_downloader_deps).
+    # Both are network/disk bound and independent, so we prefetch the big weight
+    # blobs on a background THREAD while pip installs torch in the foreground -
+    # hiding most of the download time.  The thread uses ONLY stdlib urllib (see
+    # _prefetch_weights_urllib): it must NOT import huggingface_hub, because the
+    # foreground pip can swap huggingface_hub's version mid-run and a stale copy
+    # cached in this process would then break the in-process smoke test.
+    # download_model() below (after every install settles) validates the
+    # prefetched files and fetches anything missing, so the prefetch is purely a
+    # best-effort head start.
     # ------------------------------------------------------------------------
     import threading
-    download_thread = None
-    download_error: dict[str, str] = {}
-    overlap = (not args.skip_install) and (not args.skip_download) \
-        and _ensure_downloader_deps()
+    prefetch_thread = None
+    overlap = (not args.skip_install) and (not args.skip_download)
     if overlap:
-        def _bg_download() -> None:
-            try:
-                download_model(args.hf_token)
-            except SystemExit as exc:
-                download_error["err"] = f"model download failed (exit {exc.code})"
-            except Exception as exc:  # noqa: BLE001
-                download_error["err"] = f"{exc.__class__.__name__}: {exc}"
-        download_thread = threading.Thread(target=_bg_download,
-                                           name="hf-model-download", daemon=True)
-        download_thread.start()
-        info("Model download started in the background (overlapping the install).")
+        prefetch_thread = threading.Thread(target=_prefetch_weights_urllib,
+                                           name="hf-weights-prefetch", daemon=True)
+        prefetch_thread.start()
+        info("Weights prefetch started in the background (overlapping the install).")
 
     if not args.skip_install:
         install_torch(use_cuda)
@@ -1102,16 +1123,16 @@ def main() -> int:
         except OSError:
             pass
 
-    if download_thread is not None:
-        info("Waiting for the background model download to finish...")
-        download_thread.join()
-        if download_error:
-            err(download_error["err"])
-            err("Verify network access to https://huggingface.co/" + HF_REPO)
-            sys.exit(1)
-    elif not args.skip_download:
-        # Non-overlapped path (e.g. --skip-install, or huggingface_hub could not
-        # be pre-installed): download sequentially as before.
+    if prefetch_thread is not None:
+        info("Waiting for the background weights prefetch to finish...")
+        prefetch_thread.join()
+
+    if not args.skip_download:
+        # Validate + fetch any weights the prefetch did not get.  huggingface_hub
+        # is imported (inside download_model) only HERE, after every pip install
+        # has settled, so this process never caches a soon-to-be-replaced
+        # huggingface_hub - the cause of the earlier "cannot import name
+        # 'HfFolder'" smoke-test failure.
         ensure_hf_xet()
         download_model(args.hf_token)
 

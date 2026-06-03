@@ -70,14 +70,16 @@ can't run on a given machine.
 
 ## 1. Faster first-time setup: parallel download
 
-`setup.py` now downloads the ~1.4 GB model weights on a BACKGROUND thread that
-runs WHILE pip installs torch/deps in the foreground (the two are independent
-and network/disk bound). The thread only downloads (huggingface_hub), never
-runs pip, so there is no concurrent-pip corruption risk; huggingface_hub is
-pre-installed up front so the parallel download can start. On a typical
-connection this hides most of the weights download behind the torch install.
-Falls back to the old sequential download if huggingface_hub can't be
-pre-installed or on `--skip-install`.
+`setup.py` now prefetches the two large weight blobs on a BACKGROUND thread
+(stdlib `urllib` only) WHILE pip installs torch/deps in the foreground (the two
+are independent and network/disk bound). The thread imports NO pip-managed
+package - importing huggingface_hub there was fatal (the foreground pip swaps
+its version mid-run, and the stale module cached in setup.py's process then
+broke the in-process smoke test with `cannot import name 'HfFolder'`). After
+the installs settle, the normal huggingface_hub-based `download_model()`
+validates the prefetched files and fetches anything missing, so the prefetch is
+a pure best-effort head start. `huggingface_hub` is pinned `<1.0` (1.x removed
+`HfFolder`, which the 1.5-era transformers stack still expects).
 
 ## 2. Faster generation of NEW entries
 
