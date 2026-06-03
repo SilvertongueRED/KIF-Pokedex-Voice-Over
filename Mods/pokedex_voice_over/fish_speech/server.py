@@ -61,6 +61,12 @@ HERE = Path(__file__).resolve().parent
 DEFAULT_REF_WAV = HERE / "reference" / "voice.wav"
 DEFAULT_REF_TXT = HERE / "reference" / "voice.txt"
 DEFAULT_CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5"
+# Optional quantized text-model checkpoints (faster generation).  The vendored
+# engine auto-detects "int8"/"int4" in the checkpoint PATH; these dirs ship only
+# the quantized text model.pth (the fp16 VQ-GAN decoder still loads from
+# DEFAULT_CHECKPOINT_DIR).  Built opt-in by setup.py / Quantize_Model.bat.
+DEFAULT_INT8_CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5-int8"
+DEFAULT_INT4_CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5-int4-g128-q"
 DEFAULT_PORT = 7861
 DEFAULT_HOST = "127.0.0.1"
 PID_FILE = HERE / "server.pid"
@@ -123,6 +129,7 @@ _model_state: dict = {
     "api_version": None,
     "load_error": None,
     "compiled": False,
+    "quant": None,
 }
 
 # Tracks last activity for the idle-shutdown watchdog (see _idle_watchdog).
@@ -221,7 +228,33 @@ def _parent_pid_monitor(parent_pid: int) -> None:
 # fish-speech 1.5 loader helpers (imported lazily after sys.path is set)
 # ---------------------------------------------------------------------------
 
-def _load_fish_speech_1_5(checkpoint_dir: Path, device: str, compile_model: bool):
+def _resolve_llama_checkpoint(base_dir: Path, quant: str):
+    """Pick the text-model checkpoint dir based on `quant`.
+
+    Returns (llama_dir, decoder_dir, quant_label).  The VQ-GAN decoder always
+    loads from the fp16 base dir (the quantized dirs ship only the text model).
+      * "auto"  -> use int8, then int4, if their dirs exist; else fp16.
+      * "int8"/"int4" -> force that dir if present, else fp16.
+      * "none"  -> always fp16.
+    """
+    decoder_dir = base_dir
+    if quant == "none":
+        return base_dir, decoder_dir, None
+    order = []
+    if quant in ("auto", "int8"):
+        order.append(("int8", DEFAULT_INT8_CHECKPOINT_DIR))
+    if quant in ("auto", "int4"):
+        order.append(("int4", DEFAULT_INT4_CHECKPOINT_DIR))
+    for label, d in order:
+        try:
+            if (d / "model.pth").exists() and (d / "config.json").exists():
+                return d, decoder_dir, label
+        except Exception:
+            pass
+    return base_dir, decoder_dir, None
+
+
+def _load_fish_speech_1_5(llama_dir: Path, decoder_dir: Path, device: str, compile_model: bool):
     """
     Load the fish-speech 1.5 models and return a ready TTSInferenceEngine.
 
@@ -290,15 +323,15 @@ def _load_fish_speech_1_5(checkpoint_dir: Path, device: str, compile_model: bool
     from fish_speech.models.vqgan.inference import load_model as load_decoder_model
     from fish_speech.inference_engine import TTSInferenceEngine
 
-    decoder_ckpt = checkpoint_dir / "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"
+    decoder_ckpt = decoder_dir / "firefly-gan-vq-fsq-8x1024-21hz-generator.pth"
 
     # launch_thread_safe_queue calls BaseTransformer.from_pretrained(checkpoint_path),
     # which expects a DIRECTORY (it loads config.json, tokenizer.tiktoken, and model.pth
     # from inside that directory). Pass the directory, not the .pth file directly.
     log.info("Launching LLaMA queue (dir=%s device=%s compile=%s)",
-             checkpoint_dir, device, do_compile)
+             llama_dir, device, do_compile)
     llama_queue = launch_thread_safe_queue(
-        checkpoint_path=str(checkpoint_dir),
+        checkpoint_path=str(llama_dir),
         device=device,
         precision=precision,
         compile=do_compile,
@@ -531,22 +564,38 @@ def _warmup_kernels(engine, ref_audio_bytes: Optional[bytes], ref_text: str,
             pass
         log.info("Background warmup pass 1 done in %.2fs", time.time() - t0)
 
-        # Optional second pass - only when explicitly requested via --full-warmup.
+        # Optional multi-length pass - only when explicitly requested via
+        # --full-warmup.  Compiling with fullgraph specialises the kernels per
+        # sequence-length bucket, so we warm a MEDIUM and a LONG sample (the
+        # short "Hello." above covers the small bucket) to span the realistic
+        # spread of Pokedex sentence lengths.  This pays the remaining JIT
+        # specialisations DURING startup instead of mid-game, the first time the
+        # player hits an unusually long entry.
         if compiled and full:
-            t0 = time.time()
-            longer_req = ServeTTSRequest(
-                text="It uses its sturdy front legs to push through the densest forests.",
-                references=refs,
-                use_memory_cache="on",
-                max_new_tokens=384,
-                temperature=0.6,
-                top_p=0.85,
-                streaming=False,
-            )
-            for _ in engine.inference(longer_req):
-                pass
-            log.info("Background warmup pass 2 (compile specialisation) done in %.2fs",
-                     time.time() - t0)
+            warm_samples = [
+                ("medium",
+                 "It has an extremely sharp sense of direction and always finds its nest.",
+                 192),
+                ("long",
+                 "It uses its sturdy front legs to push through the densest forests, "
+                 "and its keen nose can track a faint scent across the whole region.",
+                 384),
+            ]
+            for label, sample_text, cap in warm_samples:
+                t0 = time.time()
+                longer_req = ServeTTSRequest(
+                    text=sample_text,
+                    references=refs,
+                    use_memory_cache="on",
+                    max_new_tokens=cap,
+                    temperature=0.6,
+                    top_p=0.85,
+                    streaming=False,
+                )
+                for _ in engine.inference(longer_req):
+                    pass
+                log.info("Background warmup (%s, cap=%d) done in %.2fs",
+                         label, cap, time.time() - t0)
         log.info("Background warmup complete - kernels ready.")
     except Exception as exc:
         log.warning("Background warmup failed (non-fatal): %s", exc)
@@ -556,7 +605,8 @@ def _warmup_kernels(engine, ref_audio_bytes: Optional[bytes], ref_text: str,
 # Model loader
 # ---------------------------------------------------------------------------
 
-def _verify_generation(engine, ref_audio_bytes, ref_text, compiled: bool = False):
+def _verify_generation(engine, ref_audio_bytes, ref_text, compiled: bool = False,
+                       max_tokens: int = 128):
     """Run ONE real generation and confirm it produces audio.
 
     Returns (True, None) on success or (False, "<reason>") on failure.  When
@@ -575,7 +625,7 @@ def _verify_generation(engine, ref_audio_bytes, ref_text, compiled: bool = False
             text="The Pokedex voice is ready.",
             references=refs,
             use_memory_cache="on",
-            max_new_tokens=128,
+            max_new_tokens=max_tokens,
             temperature=0.6,
             top_p=0.85,
             streaming=False,
@@ -668,7 +718,9 @@ class ModelHolder:
              device_override: Optional[str] = None,
              compile_model: bool = False,
              full_warmup: bool = False,
-             skip_warmup: bool = False) -> None:
+             skip_warmup: bool = False,
+             quant: str = "auto",
+             proven: bool = False) -> None:
         """
         Load fish-speech weights and (optionally) warm the inference path.
 
@@ -694,37 +746,61 @@ class ModelHolder:
                 prompt_text = ref_txt.read_text(encoding="utf-8").strip() if ref_txt.exists() else ""
                 ref_audio_bytes = ref_wav.read_bytes() if ref_wav.exists() else None
 
-                # Build the engine (compiled only if requested AND on CUDA).
-                engine, precision, compiled = _load_fish_speech_1_5(
-                    checkpoint_dir, device, want_compile)
+                # Resolve fp16 vs quantized checkpoint for the text model (the
+                # VQ-GAN decoder always loads fp16 from checkpoint_dir).
+                llama_dir, decoder_dir, quant_label = _resolve_llama_checkpoint(
+                    checkpoint_dir, quant)
+                if quant_label:
+                    log.info("Using %s quantized text model (%s); decoder fp16 (%s)",
+                             quant_label, llama_dir.name, decoder_dir.name)
+
+                # On a machine that has already PROVEN compile works (.compile_ok)
+                # the verify generation can be shorter - it only needs to confirm
+                # audio comes out, not warm long-sequence kernels (the persistent
+                # inductor cache already holds them).
+                vtok = 48 if proven else 128
+
+                def _attempt(ldir, ddir, do_comp):
+                    eng, prec, comp = _load_fish_speech_1_5(ldir, ddir, device, do_comp)
+                    if not skip_warmup:
+                        _prime_reference(eng, ref_audio_bytes, prompt_text)
+                    okv, errv = _verify_generation(eng, ref_audio_bytes, prompt_text,
+                                                   compiled=comp, max_tokens=vtok)
+                    return eng, prec, comp, okv, errv
 
                 # --------------------------------------------------------------
-                # VERIFY-THEN-COMMIT - the safety net that makes enabling
-                # compile impossible to turn into "no audio".  We run a REAL
-                # generation now and only flip ready=True once it has actually
-                # produced audio.  When compiled, this first generation also
-                # pays the torch.compile JIT (~30-90 s the very first time; the
-                # inductor cache makes later launches fast).  If the COMPILED
-                # engine fails to generate (Triton missing/broken, a bad kernel,
-                # etc.) we discard it and rebuild WITHOUT compile, then verify
-                # again - so the worst case is "no speedup", never silence.
+                # VERIFY-THEN-COMMIT with graceful fallbacks.  ready=True is only
+                # set once a REAL generation has produced audio, trying in order:
+                #   1. requested checkpoint (quantized if selected) + compile
+                #   2. same checkpoint, compile OFF (compile broke on this box)
+                #   3. fp16 base checkpoint (quantized weights don't work here)
+                #      + compile, then fp16 base uncompiled.
+                # The worst case is plain fp16 uncompiled - never silence.
                 # --------------------------------------------------------------
-                if not skip_warmup:
-                    _prime_reference(engine, ref_audio_bytes, prompt_text)
-                ok, err = _verify_generation(engine, ref_audio_bytes, prompt_text,
-                                             compiled=compiled)
+                engine, precision, compiled, ok, err = _attempt(
+                    llama_dir, decoder_dir, want_compile)
+
                 if not ok and want_compile:
                     _model_state["compile_note"] = err
                     log.warning("Compiled engine FAILED verification (%s) - "
                                 "rebuilding WITHOUT torch.compile so narration "
                                 "still works (no speedup, but no silence).", err)
                     _free_engine(engine)
-                    engine, precision, compiled = _load_fish_speech_1_5(
-                        checkpoint_dir, device, False)
-                    if not skip_warmup:
-                        _prime_reference(engine, ref_audio_bytes, prompt_text)
-                    ok, err = _verify_generation(engine, ref_audio_bytes,
-                                                 prompt_text, compiled=False)
+                    engine, precision, compiled, ok, err = _attempt(
+                        llama_dir, decoder_dir, False)
+
+                if not ok and quant_label:
+                    log.warning("Quantized (%s) engine FAILED verification (%s) - "
+                                "falling back to the fp16 model.", quant_label, err)
+                    _free_engine(engine)
+                    quant_label = None
+                    engine, precision, compiled, ok, err = _attempt(
+                        checkpoint_dir, checkpoint_dir, want_compile)
+                    if not ok and want_compile:
+                        _free_engine(engine)
+                        engine, precision, compiled, ok, err = _attempt(
+                            checkpoint_dir, checkpoint_dir, False)
+
                 if not ok:
                     _model_state["load_error"] = f"Generation verification failed: {err}"
                     log.error("fish-speech load failed verification: %s", err)
@@ -737,11 +813,12 @@ class ModelHolder:
                 _model_state["prompt_audio_bytes"] = ref_audio_bytes
                 _model_state["api_version"] = "1.5"
                 _model_state["compiled"] = compiled
+                _model_state["quant"] = quant_label
                 if compiled:
                     _model_state["compile_note"] = None
                 _model_state["ready"] = True
-                log.info("fish-speech ready (api=1.5 device=%s compiled=%s ref=%s transcript=%d chars)",
-                         device, compiled, ref_wav.exists(), len(prompt_text))
+                log.info("fish-speech ready (api=1.5 device=%s compiled=%s quant=%s ref=%s transcript=%d chars)",
+                         device, compiled, quant_label, ref_wav.exists(), len(prompt_text))
             except ImportError as exc:
                 msg = (f"Could not import fish-speech 1.5 from {DEFAULT_CHECKPOINT_DIR}: {exc}. "
                        f"Ensure the checkpoint directory exists and run setup.py.")
@@ -904,6 +981,7 @@ class TTSHandler(BaseHTTPRequestHandler):
                 "device": _model_state.get("device"),
                 "api_version": _model_state.get("api_version"),
                 "compiled": _model_state.get("compiled", False),
+                "quant": _model_state.get("quant"),
                 "error": err,
             })
             return
@@ -1092,6 +1170,15 @@ def main() -> int:
                         help="Inductor-only mode (ignored for the cudagraphs "
                              "backend). 'default' is robust; 'reduce-overhead' "
                              "adds CUDA graphs for a little more speed.")
+    parser.add_argument("--quant", choices=["auto", "none", "int8", "int4"],
+                        default=os.environ.get("POKEDEX_VO_QUANT", "auto"),
+                        help="Which text-model precision to load. 'auto' (DEFAULT) "
+                             "uses a quantized checkpoint (int8 preferred, then int4) "
+                             "when checkpoints/fish-speech-1.5-int8 exists, else the "
+                             "fp16 model. Build one with Quantize_Model.bat. 'none' "
+                             "forces fp16. The server verifies a real generation and "
+                             "falls back to fp16 if the quantized model can't generate "
+                             "on this machine.")
     parser.add_argument("--self-test", action="store_true", default=False,
                         help="Load the model (honouring --compile / --compile-mode), "
                              "run a few timed test generations, print PASS/FAIL + "
@@ -1139,11 +1226,14 @@ def main() -> int:
               "running uncompiled. Delete it to retry.", file=sys.stderr)
         args.compile_model = False
 
-    # When compile is in effect, pre-warm thoroughly: the second warmup pass
-    # generates a longer sentence so torch.compile specialises the kernels for
-    # realistic Pokedex-entry sequence lengths DURING startup - i.e. while the
-    # player is still walking to the Pokedex.  Skipped entirely under --fast-start.
-    if args.compile_model and not args.fast_start:
+    # Once a machine has PROVEN it can compile (a successful compiled launch
+    # wrote .compile_ok), later launches skip the heavyweight multi-length
+    # warmup: the persistent inductor cache already holds those kernels, so a
+    # tiny "Hello." warmup is enough.  This trims a few seconds off every
+    # subsequent boot.  The first (unproven) compiled launch still warms fully.
+    _compile_ok_marker = HERE / ".compile_ok"
+    proven = _compile_ok_marker.exists()
+    if args.compile_model and not args.fast_start and not proven:
         args.full_warmup = True
 
     if not args.checkpoint_dir.exists():
@@ -1207,7 +1297,7 @@ def main() -> int:
               f"mode={args.compile_mode})...", file=sys.stderr)
         ModelHolder.load(args.checkpoint_dir, args.reference_wav, args.reference_txt,
                          device_override=device, compile_model=args.compile_model,
-                         full_warmup=False, skip_warmup=False)
+                         full_warmup=False, skip_warmup=False, quant=args.quant)
         if not _model_state["ready"]:
             print(f"[fish-tts] SELF-TEST FAILED to load: {_model_state.get('load_error')}",
                   file=sys.stderr)
@@ -1245,6 +1335,8 @@ def main() -> int:
         avg = sum(times) / len(times) if times else 0.0
         print(f"[fish-tts] SELF-TEST PASS: device={_model_state.get('device')} "
               f"compiled={_model_state.get('compiled')} "
+              f"quant={_model_state.get('quant')} "
+              f"mode={os.environ.get('POKEDEX_VO_COMPILE_MODE', 'default')} "
               f"avg={avg:.2f}s/sentence over {len(times)} gens.", file=sys.stderr)
         return 0
 
@@ -1313,7 +1405,9 @@ def main() -> int:
                              device_override=device,
                              compile_model=args.compile_model,
                              full_warmup=args.full_warmup,
-                             skip_warmup=args.fast_start)
+                             skip_warmup=args.fast_start,
+                             quant=args.quant,
+                             proven=proven)
             if _model_state["ready"]:
                 # Remember the compile outcome so we neither keep paying a failed
                 # compile cost every launch, nor stay disabled once it works.
@@ -1326,9 +1420,24 @@ def main() -> int:
                             encoding="utf-8")
                         log.info("Wrote %s - compile will be skipped next launch.",
                                  _compile_marker.name)
+                        # Not compiled -> drop the "proven" marker so the next
+                        # compiled launch warms fully again.
+                        try:
+                            _compile_ok_marker.unlink()
+                        except OSError:
+                            pass
                     elif _model_state.get("compiled"):
                         try:
                             _compile_marker.unlink()
+                        except OSError:
+                            pass
+                        # Record that compile is proven here so later launches
+                        # can skip the heavy multi-length warmup.
+                        try:
+                            _compile_ok_marker.write_text(
+                                "compiled generation verified on this machine; "
+                                "later launches skip the heavy warm-up. Delete to "
+                                "force a full re-warm.", encoding="utf-8")
                         except OSError:
                             pass
                 except Exception as exc:

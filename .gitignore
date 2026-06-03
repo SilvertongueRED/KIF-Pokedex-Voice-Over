@@ -23,6 +23,8 @@ Mods/pokedex_voice_over/fish_speech/smoke_test.wav
 Mods/pokedex_voice_over/fish_speech/.installed
 Mods/pokedex_voice_over/fish_speech/setup.log
 Mods/pokedex_voice_over/fish_speech/.torch_cache/
+Mods/pokedex_voice_over/fish_speech/.compile_disabled
+Mods/pokedex_voice_over/fish_speech/.compile_ok
 
 # Downloaded model weights (~1.4 GB, fetched at first launch from HuggingFace)
 Mods/pokedex_voice_over/fish_speech/checkpoints/

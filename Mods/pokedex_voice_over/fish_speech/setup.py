@@ -61,6 +61,16 @@ REFERENCE_TXT = REFERENCE_DIR / "voice.txt"
 CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5"
 HF_REPO = "fishaudio/fish-speech-1.5"
 
+# Quantized checkpoint dirs (optional, faster generation).  The vendored engine
+# (llama.py from_pretrained) auto-detects the substrings "int8" / "int4" in the
+# checkpoint PATH and swaps in the quantized Linear kernels, so producing a
+# quantized model.pth in one of these sibling dirs is all that is needed - the
+# server points the text model at it and still loads the fp16 decoder from
+# CHECKPOINT_DIR.  The int4 dir name is shaped so llama.py's groupsize parser
+# (path.name.split("-")[-2] -> "g128") works.
+INT8_CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5-int8"
+INT4_CHECKPOINT_DIR = HERE / "checkpoints" / "fish-speech-1.5-int4-g128-q"
+
 # Files the fish-speech 1.5 release ships.  We download these explicitly so
 # we don't pull every blob in the repo (the checkpoint folder has 8+ GB of
 # optional alternative formats).
@@ -886,6 +896,107 @@ def slim_install() -> None:
 
 
 # ---------------------------------------------------------------------------
+# Parallel download helper + optional quantization
+# ---------------------------------------------------------------------------
+
+def _ensure_downloader_deps() -> bool:
+    """Make sure huggingface_hub (and, best-effort, hf_xet) are importable so the
+    ~1.4 GB weights download can run on a background thread IN PARALLEL with the
+    heavy torch/deps install.
+
+    Returns True only if huggingface_hub is importable afterwards (i.e. the
+    parallel download is safe to start).  We install it in the FOREGROUND here:
+    the background thread must never run pip, because two concurrent pip
+    processes can corrupt the shared site-packages.
+    """
+    if not _module_importable("huggingface_hub"):
+        info("Pre-installing huggingface_hub so the model download can overlap "
+             "the torch install...")
+        try:
+            run_pip(["huggingface_hub>=0.23"])
+        except Exception as exc:  # noqa: BLE001
+            warn(f"Could not pre-install huggingface_hub ({exc}); the model "
+                 f"download will run sequentially after the deps install.")
+            return False
+    # hf_xet is a pure download-speed nicety; safe to install in the foreground.
+    ensure_hf_xet()
+    return _module_importable("huggingface_hub")
+
+
+def quantize_model(mode: str) -> None:
+    """Build a quantized copy of the LLaMA text->semantic weights for faster
+    generation.  int8 weight-only (recommended) runs on CPU; int4 needs CUDA.
+
+    The heavy lifting (the quantized Linear kernels) already lives in the
+    vendored engine - llama.py's from_pretrained swaps them in when it sees
+    "int8"/"int4" in the checkpoint path - so all we do here is write a
+    quantized model.pth into a sibling checkpoint dir plus a copy of the small
+    config/tokenizer files.  The server auto-detects and uses it, and verifies a
+    real generation before committing, so a bad quantization can never silence
+    the mod (it falls back to fp16).  Off by default so first-run setup stays
+    fast; opt in with --quantize int8 (or POKEDEX_VO_QUANTIZE=int8).
+    """
+    if mode not in ("int8", "int4"):
+        return
+    dst = INT8_CHECKPOINT_DIR if mode == "int8" else INT4_CHECKPOINT_DIR
+    target = dst / "model.pth"
+    if _checkpoint_is_valid(target, "model.pth"):
+        ok(f"{mode} checkpoint already present at {dst.name} - skipping.")
+        return
+    if not _checkpoint_is_valid(CHECKPOINT_DIR / "model.pth", "model.pth"):
+        err(f"Base weights missing/invalid at {CHECKPOINT_DIR} - download them "
+            f"before quantizing.")
+        return
+    try:
+        import torch
+    except ImportError:
+        err("torch is not installed - run setup without --skip-install first, "
+            "then quantize.")
+        return
+    if mode == "int4" and not torch.cuda.is_available():
+        err("int4 quantization needs CUDA (it uses a CUDA-only weight-packing "
+            "op).  Use --quantize int8 on this machine.")
+        return
+
+    info(f"Quantizing the text model to {mode} (one-time).  This loads the full "
+         f"model and can take a few minutes...")
+    t0 = time.time()
+    try:
+        from fish_speech.models.text2semantic.llama import BaseTransformer
+        # CHECKPOINT_DIR has no 'int8'/'int4' in its name, so this loads the
+        # plain fp16/bf16 model that we then quantize.
+        model = BaseTransformer.from_pretrained(str(CHECKPOINT_DIR),
+                                                load_weights=True)
+        model = model.to(dtype=torch.bfloat16)
+        if mode == "int8":
+            from tools.llama.quantize import WeightOnlyInt8QuantHandler as QH
+            sd = QH(model).create_quantized_state_dict()
+        else:
+            from tools.llama.quantize import WeightOnlyInt4QuantHandler as QH
+            sd = QH(model, groupsize=128).create_quantized_state_dict()
+    except Exception as exc:  # noqa: BLE001
+        err(f"Quantization failed ({exc.__class__.__name__}: {exc}). "
+            f"The mod will keep using the fp16 model.")
+        return
+
+    try:
+        dst.mkdir(parents=True, exist_ok=True)
+        for fname in ("config.json", "tokenizer.tiktoken", "special_tokens.json"):
+            src = CHECKPOINT_DIR / fname
+            if src.exists():
+                shutil.copy2(src, dst / fname)
+        target.unlink(missing_ok=True)
+        torch.save(sd, target)
+    except Exception as exc:  # noqa: BLE001
+        err(f"Could not write the quantized checkpoint ({exc}).")
+        return
+    size_mb = target.stat().st_size / (1024 * 1024) if target.exists() else 0
+    ok(f"{mode} checkpoint written to {dst.name} ({size_mb:.0f} MB) in "
+       f"{time.time() - t0:.0f}s.  The server uses it automatically on next "
+       f"launch (delete the folder to revert to fp16).")
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -910,6 +1021,13 @@ def main() -> int:
     parser.add_argument("--no-slim", action="store_true",
                         help="Skip the post-install slimming pass (keeps torch "
                              "headers/.lib and any dev packages installed).")
+    parser.add_argument("--quantize", choices=["none", "int8", "int4"],
+                        default=os.environ.get("POKEDEX_VO_QUANTIZE", "none"),
+                        help="Also build a quantized copy of the text model for "
+                             "faster generation (int8 recommended; int4 needs a "
+                             "CUDA GPU).  The server uses it automatically when "
+                             "present.  Off by default so first-run setup stays "
+                             "fast - run later via Quantize_Model.bat.")
     args = parser.parse_args()
 
     info(f"Platform: {platform.platform()}")
@@ -934,6 +1052,33 @@ def main() -> int:
 
     use_cuda = (not args.force_cpu) and detect_cuda()
 
+    # ------------------------------------------------------------------------
+    # Overlap the ~1.4 GB weights download with the heavy torch/deps install.
+    # Both are network/disk bound and independent, so we kick the model
+    # download off on a background THREAD while pip installs torch in the
+    # foreground - hiding most of the download time.  The thread only DOWNLOADS
+    # (huggingface_hub), never runs pip, because two concurrent pip processes
+    # can corrupt the shared site-packages.  Requires huggingface_hub up front
+    # (installed in the foreground by _ensure_downloader_deps).
+    # ------------------------------------------------------------------------
+    import threading
+    download_thread = None
+    download_error: dict[str, str] = {}
+    overlap = (not args.skip_install) and (not args.skip_download) \
+        and _ensure_downloader_deps()
+    if overlap:
+        def _bg_download() -> None:
+            try:
+                download_model(args.hf_token)
+            except SystemExit as exc:
+                download_error["err"] = f"model download failed (exit {exc.code})"
+            except Exception as exc:  # noqa: BLE001
+                download_error["err"] = f"{exc.__class__.__name__}: {exc}"
+        download_thread = threading.Thread(target=_bg_download,
+                                           name="hf-model-download", daemon=True)
+        download_thread.start()
+        info("Model download started in the background (overlapping the install).")
+
     if not args.skip_install:
         install_torch(use_cuda)
         install_fish_speech()
@@ -957,13 +1102,24 @@ def main() -> int:
         except OSError:
             pass
 
-    if not args.skip_download:
-        # Best-effort: enable HuggingFace's Xet fast-download path if we can.
-        # Never fatal - falls back to plain HTTP (see ensure_hf_xet).
+    if download_thread is not None:
+        info("Waiting for the background model download to finish...")
+        download_thread.join()
+        if download_error:
+            err(download_error["err"])
+            err("Verify network access to https://huggingface.co/" + HF_REPO)
+            sys.exit(1)
+    elif not args.skip_download:
+        # Non-overlapped path (e.g. --skip-install, or huggingface_hub could not
+        # be pre-installed): download sequentially as before.
         ensure_hf_xet()
         download_model(args.hf_token)
 
     prepare_reference(args.reference)
+
+    # Optional one-time quantization (opt-in; the server auto-uses the result).
+    if args.quantize and args.quantize != "none":
+        quantize_model(args.quantize)
 
     # IMPORTANT ORDERING: slim BEFORE the smoke test.
     #

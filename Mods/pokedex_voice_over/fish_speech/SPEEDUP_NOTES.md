@@ -60,3 +60,71 @@ fixed entry twice (delete its cached WAV first so it regenerates):
 
 Compare with `--no-compile` (slow baseline) vs default (compiled). On a 4090
 expect roughly 2-3x faster steady-state generation, plus TF32 on top.
+
+# Round 2 speedups (2026-06-03)
+
+Four more changes targeting (1) first-time setup, (2) generation of NEW
+(uncached) entries, and (3) subsequent launches. All are safe-by-default: the
+server still verify-then-commits a real generation and falls back if anything
+can't run on a given machine.
+
+## 1. Faster first-time setup: parallel download
+
+`setup.py` now downloads the ~1.4 GB model weights on a BACKGROUND thread that
+runs WHILE pip installs torch/deps in the foreground (the two are independent
+and network/disk bound). The thread only downloads (huggingface_hub), never
+runs pip, so there is no concurrent-pip corruption risk; huggingface_hub is
+pre-installed up front so the parallel download can start. On a typical
+connection this hides most of the weights download behind the torch install.
+Falls back to the old sequential download if huggingface_hub can't be
+pre-installed or on `--skip-install`.
+
+## 2. Faster generation of NEW entries
+
+a. **int8 (and optional int4) weight-only quantization.** The decode loop is
+   batch-1 and memory-bandwidth bound, so int8 weight-only typically gives
+   ~1.3-1.8x on top of compile, with negligible quality change, and ~halves the
+   weights on disk (also speeds load). The vendored engine already supports it
+   (llama.py from_pretrained swaps in the quantized Linear kernels when it sees
+   "int8"/"int4" in the checkpoint path), so we just:
+     - build a quantized model.pth via `setup.py --quantize int8`
+       (or `Quantize_Model.bat` / `quantize_model.sh`), written to
+       `checkpoints/fish-speech-1.5-int8/`;
+     - the server's new `--quant auto` (DEFAULT) loads it when present, with the
+       fp16 VQ-GAN decoder still loaded from the base dir.
+   The server VERIFIES a real generation with the quantized model and falls back
+   to fp16 (uncompiled if needed) if it can't generate here, so quantization can
+   never silence the mod. Off by default in setup so first-run stays fast - opt
+   in any time with Quantize_Model.bat. int8 builds on CPU; int4 needs CUDA.
+   Quality is subjective - A/B int8 vs fp16 with Benchmark_Compile.bat
+   (`--quant none` forces fp16) before committing to it.
+
+b. **reduce-overhead (CUDA graphs) is now easy to A/B.** Benchmark_Compile.bat
+   runs baseline vs inductor/default vs inductor/reduce-overhead and prints the
+   active `mode=` + `quant=`. Set `POKEDEX_VO_COMPILE_MODE=reduce-overhead` to
+   use it in play if it's faster and still sounds correct (left at "default" out
+   of the box because CUDA graphs can be finicky on some setups).
+
+c. **Multi-length warmup.** The compiled warmup pass now warms a MEDIUM and a
+   LONG sample (in addition to the short "Hello.") so torch.compile specialises
+   the kernels for the realistic spread of Pokedex sentence lengths DURING
+   startup, instead of paying a JIT recompile mid-game on the first unusually
+   long entry.
+
+## 3. Faster subsequent launches: .compile_ok fast-launch gate
+
+The first launch that successfully compiles writes a `.compile_ok` marker. On
+every later launch the server skips the heavyweight multi-length warmup (the
+persistent inductor cache already holds those kernels) and uses a shorter verify
+generation - trimming a few seconds off each boot. If a later launch ever fails
+to compile, the marker is cleared so the next compiled launch warms fully again.
+
+## How to use
+
+- Nothing required for #1 and #3 (automatic) or #2b/#2c.
+- For int8: run `Quantize_Model.bat` (Windows) or `./quantize_model.sh`
+  (Linux/macOS) once, after the mod's first-run setup. The server picks it up on
+  the next launch. Delete `checkpoints/fish-speech-1.5-int8` to revert to fp16,
+  or launch with `--quant none` / `POKEDEX_VO_QUANT=none`.
+- To benchmark: `Benchmark_Compile.bat` (compares uncompiled / inductor-default /
+  inductor-reduce-overhead, and shows quant=).
