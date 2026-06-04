@@ -51,6 +51,12 @@
       "label": "TTS Fallback (Piper)",
       "type": "toggle",
       "default": true
+    },
+    {
+      "key": "idle_prefetch",
+      "label": "Idle Pre-Generation",
+      "type": "toggle",
+      "default": true
     }
   ]
 }

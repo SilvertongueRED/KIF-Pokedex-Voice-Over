@@ -130,6 +130,11 @@ _model_state: dict = {
     "load_error": None,
     "compiled": False,
     "quant": None,
+    # True while a compiled engine is being built in the background AFTER the
+    # uncompiled engine is already serving (see _compile_and_swap).  Surfaced
+    # in /health so the mod can show "usable now, getting faster" instead of
+    # leaving the player waiting the full ~2 min compile before any audio.
+    "compiling": False,
 }
 
 # Tracks last activity for the idle-shutdown watchdog (see _idle_watchdog).
@@ -848,6 +853,112 @@ class ModelHolder:
 
 
 # ---------------------------------------------------------------------------
+# Background compile + hot-swap
+# ---------------------------------------------------------------------------
+
+def _compile_and_swap(checkpoint_dir: Path, ref_audio_bytes: Optional[bytes],
+                      ref_text: str, device: str, quant: str = "auto",
+                      full_warmup: bool = True, proven: bool = False) -> None:
+    """
+    Build a torch.compile()'d engine in the BACKGROUND while the already-loaded
+    UNCOMPILED engine keeps serving /tts, then atomically hot-swap it in once a
+    real generation has verified it works.
+
+    This is what lets the first Pokedex entry play within ~15 s of the server
+    starting even on a cold inductor cache: the player gets the (slower)
+    uncompiled voice immediately, and generation transparently becomes ~2-3x
+    faster the moment the compiled engine is verified (~1-2 min later on the
+    first ever compile, near-instant once .torch_cache is warm).
+
+    Safety: identical verify-then-commit contract as ModelHolder.load - the
+    compiled engine is NEVER swapped in until it has produced audio here, so a
+    machine where compile can't work just keeps the uncompiled engine (no
+    speed-up, but never silence).  Markers (.compile_ok / .compile_disabled)
+    are owned by this function in the uncompiled-first flow.
+    """
+    compile_ok_marker = HERE / ".compile_ok"
+    compile_disabled_marker = HERE / ".compile_disabled"
+    engine = None
+    try:
+        llama_dir, decoder_dir, quant_label = _resolve_llama_checkpoint(
+            checkpoint_dir, quant)
+        log.info("Background compile starting (uncompiled engine already "
+                 "serving; this builds the faster compiled engine)...")
+        engine, precision, comp = _load_fish_speech_1_5(
+            llama_dir, decoder_dir, device, True)
+        _prime_reference(engine, ref_audio_bytes, ref_text)
+        vtok = 48 if proven else 128
+        ok, err = _verify_generation(engine, ref_audio_bytes, ref_text,
+                                     compiled=True, max_tokens=vtok)
+        if not ok:
+            log.warning("Background compiled engine FAILED verification (%s) - "
+                        "keeping the uncompiled engine (no speed-up, no silence).",
+                        err)
+            _free_engine(engine)
+            _model_state["compiling"] = False
+            _model_state["compile_note"] = err
+            try:
+                compile_disabled_marker.write_text(
+                    "torch.compile verification failed on this machine; delete "
+                    "this file (or re-run setup.py) to retry.", encoding="utf-8")
+            except OSError:
+                pass
+            try:
+                compile_ok_marker.unlink()
+            except OSError:
+                pass
+            return
+
+        # Verified - hot-swap under the lock so /tts requests see a consistent
+        # engine.  Grab the old engine so we can free its VRAM afterwards.
+        with _model_lock:
+            old_engine = _model_state.get("engine")
+            _model_state["engine"] = engine
+            _model_state["precision"] = precision
+            _model_state["compiled"] = True
+            _model_state["quant"] = quant_label
+            _model_state["compile_note"] = None
+            _model_state["compiling"] = False
+        log.info("Hot-swapped to the compiled engine - generation is now the "
+                 "faster path.%s",
+                 f" (quant={quant_label})" if quant_label else "")
+        print("[fish-tts] Compiled engine ready - generation is now faster.",
+              file=sys.stderr)
+        try:
+            compile_ok_marker.write_text(
+                "compiled generation verified on this machine; later launches "
+                "skip the heavy warm-up. Delete to force a full re-warm.",
+                encoding="utf-8")
+        except OSError:
+            pass
+        try:
+            compile_disabled_marker.unlink()
+        except OSError:
+            pass
+
+        # Free the old uncompiled engine's GPU memory, but only AFTER a grace
+        # period so any /tts request that captured it mid-generation finishes
+        # cleanly (synthesize() snapshots _model_state["engine"] at call time).
+        if old_engine is not None:
+            def _delayed_free(e):
+                time.sleep(20)
+                _free_engine(e)
+            threading.Thread(target=_delayed_free, args=(old_engine,),
+                             name="fish-tts-free-uncompiled", daemon=True).start()
+
+        # Specialise the compiled kernels for the realistic spread of sentence
+        # lengths while the player is still browsing (only on the first compile;
+        # a warm inductor cache already holds these on later launches).
+        if full_warmup:
+            _warmup_kernels(engine, ref_audio_bytes, ref_text, True, full=True)
+    except Exception as exc:
+        log.exception("Background compile/swap crashed (non-fatal): %s", exc)
+        _model_state["compiling"] = False
+        if engine is not None:
+            _free_engine(engine)
+
+
+# ---------------------------------------------------------------------------
 # Inference
 # ---------------------------------------------------------------------------
 
@@ -981,6 +1092,12 @@ class TTSHandler(BaseHTTPRequestHandler):
                 "device": _model_state.get("device"),
                 "api_version": _model_state.get("api_version"),
                 "compiled": _model_state.get("compiled", False),
+                # True once the server is usable (uncompiled) but a faster
+                # compiled engine is still being built in the background.  The
+                # mod can use this to show "voice ready, optimising..." and to
+                # know the first few entries will be a touch slower than later
+                # ones (which will use the hot-swapped compiled engine).
+                "compiling": _model_state.get("compiling", False),
                 "quant": _model_state.get("quant"),
                 "error": err,
             })
@@ -1396,60 +1513,56 @@ def main() -> int:
                          name="fish-tts-parent-monitor",
                          daemon=True).start()
 
-    # Kick off model load + warmup in a background thread.  /health
-    # answers "warming" until this completes, then "ready".
+    # Kick off model load in a background thread.  /health answers "warming"
+    # until the (uncompiled) weights are in memory, then "ready".
+    #
+    # NEW (uncompiled-first): when compile is wanted, we deliberately load
+    # UNCOMPILED first so /tts is usable in ~15 s, then build the compiled
+    # engine on ANOTHER background thread and hot-swap it in once verified
+    # (see _compile_and_swap).  This turns the old "~2 min of silence while the
+    # very first compile runs" into "voice works almost immediately, gets
+    # faster shortly after".  On CPU/MPS (where compile is a no-op) or when a
+    # prior compile failed (.compile_disabled => args.compile_model already
+    # forced False above), this collapses to a single plain load.
+    want_bg_compile = bool(args.compile_model) and not args.self_test
     def _background_load() -> None:
         try:
+            # Phase 1: load uncompiled (fast time-to-usable).  Even when compile
+            # is wanted we load uncompiled here and upgrade in Phase 2.
             ModelHolder.load(args.checkpoint_dir, args.reference_wav,
                              args.reference_txt,
                              device_override=device,
-                             compile_model=args.compile_model,
-                             full_warmup=args.full_warmup,
+                             compile_model=False,
+                             full_warmup=False,
                              skip_warmup=args.fast_start,
                              quant=args.quant,
                              proven=proven)
-            if _model_state["ready"]:
-                # Remember the compile outcome so we neither keep paying a failed
-                # compile cost every launch, nor stay disabled once it works.
-                # Only touch the marker when we actually attempted compile.
-                try:
-                    if args.compile_model and not _model_state.get("compiled"):
-                        _compile_marker.write_text(
-                            "torch.compile verification failed on this machine; "
-                            "delete this file (or re-run setup.py) to retry.",
-                            encoding="utf-8")
-                        log.info("Wrote %s - compile will be skipped next launch.",
-                                 _compile_marker.name)
-                        # Not compiled -> drop the "proven" marker so the next
-                        # compiled launch warms fully again.
-                        try:
-                            _compile_ok_marker.unlink()
-                        except OSError:
-                            pass
-                    elif _model_state.get("compiled"):
-                        try:
-                            _compile_marker.unlink()
-                        except OSError:
-                            pass
-                        # Record that compile is proven here so later launches
-                        # can skip the heavy multi-length warmup.
-                        try:
-                            _compile_ok_marker.write_text(
-                                "compiled generation verified on this machine; "
-                                "later launches skip the heavy warm-up. Delete to "
-                                "force a full re-warm.", encoding="utf-8")
-                        except OSError:
-                            pass
-                except Exception as exc:
-                    log.debug("compile marker update skipped: %s", exc)
-                print(f"[fish-tts] Model READY "
-                      f"(device={_model_state['device']}, "
-                      f"api={_model_state['api_version']}, "
-                      f"compiled={_model_state.get('compiled')})",
-                      file=sys.stderr)
-            else:
+            if not _model_state["ready"]:
                 print(f"[fish-tts] Model load FAILED: "
                       f"{_model_state.get('load_error')}", file=sys.stderr)
+                return
+
+            print(f"[fish-tts] Model READY "
+                  f"(device={_model_state['device']}, "
+                  f"api={_model_state['api_version']}, "
+                  f"compiled=False{' - compiling in background' if want_bg_compile and _model_state.get('device') == 'cuda' else ''})",
+                  file=sys.stderr)
+
+            # Phase 2: upgrade to the compiled engine in the background (CUDA
+            # only - compile does nothing on CPU/MPS).  The uncompiled engine
+            # keeps serving every /tts request until the swap completes.
+            if want_bg_compile and _model_state.get("device") == "cuda":
+                _model_state["compiling"] = True
+                ref_bytes = _model_state.get("prompt_audio_bytes")
+                ref_text = _model_state.get("prompt_text", "")
+                threading.Thread(
+                    target=_compile_and_swap,
+                    args=(args.checkpoint_dir, ref_bytes, ref_text, "cuda"),
+                    kwargs={"quant": args.quant,
+                            "full_warmup": (not proven),
+                            "proven": proven},
+                    name="fish-tts-bg-compile",
+                    daemon=True).start()
         except Exception as exc:
             log.exception("Background model load crashed: %s", exc)
             _model_state["load_error"] = f"{exc.__class__.__name__}: {exc}"
@@ -1457,6 +1570,7 @@ def main() -> int:
     threading.Thread(target=_background_load,
                      name="fish-tts-model-loader",
                      daemon=True).start()
+
 
     try:
         _http_server.serve_forever()

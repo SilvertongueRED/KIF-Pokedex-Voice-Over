@@ -714,6 +714,174 @@ module PokedexVoiceOver
     cache_bare
   end
 
+  # =========================================================================
+  # Idle background pre-generation
+  # -------------------------------------------------------------------------
+  # While the player sits idle on a Pokédex entry, quietly pre-generate the
+  # TTS audio for the NEARBY entries they're most likely to scroll to next, so
+  # those entries play instantly instead of waiting on live synthesis.  It only
+  # ever acts when:
+  #   * the cursor has sat still for >= PREFETCH_IDLE_DELAY (so it never fights
+  #     the live narration of the entry the player just landed on),
+  #   * the sidecar is up AND not mid background-compile (so we don't steal GPU
+  #     from the one-time compile pass), and
+  #   * the target sentence isn't already cached.
+  # It generates exactly ONE sentence per tick and re-reads the cursor between
+  # sentences, so active scrolling instantly pauses it.  The worker is stopped
+  # by a flag the scene flips on close — it is NEVER Thread#kill'd, because
+  # killing a thread blocked on a TCPSocket read segfaults MKXP-Z.  Pure
+  # best-effort: any error just ends the pass, never the game.
+  # =========================================================================
+
+  PREFETCH_WINDOW     = 6     # entries ahead/behind to pre-generate around the cursor
+  PREFETCH_IDLE_DELAY = 1.5   # seconds the cursor must sit still before we start
+  PREFETCH_TICK       = 1.0   # worker poll interval (seconds)
+
+  def self.prefetch_enabled?
+    return false unless fish_speech_enabled?
+    if defined?(ModSettingsMenu) && ModSettingsMenu.respond_to?(:get)
+      val = (ModSettingsMenu.get(:pokedex_vo_idle_prefetch) rescue nil)
+      return val unless val.nil?
+    end
+    settings.fetch("idle_prefetch", true)
+  end
+
+  # Start the idle prefetch worker for a Pokédex info scene.  Safe to call
+  # repeatedly; only one worker runs at a time.
+  def self.prefetch_start(scene)
+    return unless enabled? && prefetch_enabled?
+    @dex_vo_prefetch_scene = scene
+    @dex_vo_prefetch_on = true
+    @dex_vo_prefetch_done ||= {}
+    # Prime the lazily-loaded manifests on THIS (main) thread so the worker
+    # never triggers their first File.read from a background thread.
+    entry_map rescue nil
+    durations rescue nil
+    if defined?(@dex_vo_prefetch_thread) && @dex_vo_prefetch_thread && @dex_vo_prefetch_thread.alive?
+      return
+    end
+    @dex_vo_prefetch_thread = Thread.new { _prefetch_worker_loop }
+    log("  idle prefetch: worker started (window=#{PREFETCH_WINDOW})")
+  rescue Exception => e
+    log("  idle prefetch: failed to start: #{e.class}: #{e.message}") rescue nil
+  end
+
+  # Stop the idle prefetch worker (called when the scene closes).  We only flip
+  # a flag — the worker exits on its next tick.  NEVER Thread#kill it.
+  def self.prefetch_stop
+    @dex_vo_prefetch_on = false
+    @dex_vo_prefetch_scene = nil
+  end
+
+  def self._prefetch_worker_loop
+    last_idx = nil
+    idle_since = Time.now.to_f
+    while @dex_vo_prefetch_on
+      sleep PREFETCH_TICK
+      break unless @dex_vo_prefetch_on
+      scene = @dex_vo_prefetch_scene
+      next unless scene
+      list = (scene.instance_variable_get(:@dexlist) rescue nil)
+      idx  = (scene.instance_variable_get(:@index) rescue nil)
+      next unless list.is_a?(Array) && idx.is_a?(Integer)
+      # Reset the idle timer whenever the cursor moves, so prefetch never
+      # competes with the live narration of the entry just landed on.
+      if idx != last_idx
+        last_idx = idx
+        idle_since = Time.now.to_f
+        next
+      end
+      next if (Time.now.to_f - idle_since) < PREFETCH_IDLE_DELAY
+      next unless _prefetch_server_ready?
+      target = _prefetch_next_target(list, idx)
+      next unless target
+      _prefetch_one_species(target)
+    end
+  rescue Exception => e
+    log("  idle prefetch: worker stopped on error: #{e.class}: #{e.message}") rescue nil
+  ensure
+    log("  idle prefetch: worker exiting") rescue nil
+  end
+
+  # One health GET; true only if the server is ready AND not mid background
+  # compile (don't steal GPU from the one-time compile pass).
+  def self._prefetch_server_ready?
+    body = _tcp_get(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/health",
+                    timeout: FISH_SPEECH_HEALTH_TIMEOUT)
+    return false unless body
+    return false unless body.include?('"ok"') && body.include?("true")
+    return false if body.include?('"compiling": true') || body.include?('"compiling":true')
+    true
+  rescue Exception
+    false
+  end
+
+  # Nearest neighbour species around the cursor that still needs audio.
+  # Scans 0, +1, -1, +2, -2, ... up to PREFETCH_WINDOW.
+  def self._prefetch_next_target(list, idx)
+    offsets = [0]
+    (1..PREFETCH_WINDOW).each { |d| offsets << d; offsets << -d }
+    offsets.each do |off|
+      i = idx + off
+      next if i < 0 || i >= list.length
+      sid = _prefetch_species_from_entry(list[i])
+      next unless sid
+      next if @dex_vo_prefetch_done[sid]
+      return sid
+    end
+    nil
+  end
+
+  def self._prefetch_species_from_entry(entry)
+    return nil if entry.nil?
+    sid =
+      if entry.is_a?(Array) then entry[0]
+      elsif entry.respond_to?(:species) then entry.species
+      elsif entry.is_a?(Hash) then (entry[:species] || entry[:id])
+      else entry
+      end
+    return sid if sid.is_a?(Integer) && sid > 0
+    return sid if sid.is_a?(Symbol)
+    nil
+  rescue Exception
+    nil
+  end
+
+  # Generate (at most) ONE uncached sentence for this species' base dex entry.
+  # Marks the species done once every sentence of every variant is cached.
+  def self._prefetch_one_species(species_id)
+    name = (species_str(species_id) rescue nil)
+    if name.nil?
+      @dex_vo_prefetch_done[species_id] = true
+      return
+    end
+    texts = (_base_dex_texts(name, species_id) rescue [])
+    if texts.nil? || texts.empty?
+      @dex_vo_prefetch_done[species_id] = true
+      return
+    end
+    sentences = texts.flat_map { |t| _split_sentences(t) }
+                     .map { |s| s.to_s.strip }.reject(&:empty?).uniq
+    pending = sentences.find { |s| !_prefetch_cached?(s) }
+    if pending.nil?
+      @dex_vo_prefetch_done[species_id] = true
+      return
+    end
+    log("  idle prefetch: #{name} (#{species_id}) — caching 1/#{sentences.length} sentence(s)")
+    _generate_tts_fish_speech(pending)
+  rescue Exception => e
+    log("  idle prefetch: #{species_id} failed: #{e.class}: #{e.message}") rescue nil
+    @dex_vo_prefetch_done[species_id] = true if @dex_vo_prefetch_done
+  end
+
+  # Quiet cache-existence check (no logging, unlike _audio_exists?).
+  def self._prefetch_cached?(text)
+    bare = _tts_cache_path(text)
+    FileTest.exist?("Audio/SE/#{bare}.wav")
+  rescue Exception
+    false
+  end
+
   # Best-effort launcher for the Fish-Speech sidecar.  Returns nothing.
   # Called once when the mod realises the server is down but the user has
   # auto-start enabled.  The server takes ~10-30s to load; we do not block -
@@ -2798,6 +2966,9 @@ if defined?(PokemonPokedexInfo_Scene)
           PokedexVoiceOver.log("  Skipping — page #{page} is not the entry page (#{POKEDEX_VO_ENTRY_PAGE})")
           PokedexVoiceOver.log("  Hint: if the voice should play here, set POKEDEX_VO_ENTRY_PAGE = #{page}")
         end
+
+        # Begin quietly pre-generating nearby entries while the player browses.
+        PokedexVoiceOver.prefetch_start(self) rescue nil
       end
     else
       PokedexVoiceOver.log("  WARNING: pbStartScene is NOT defined — cannot hook scene open")
@@ -2967,6 +3138,7 @@ if defined?(PokemonPokedexInfo_Scene)
       def pbEndScene(*args)
         PokedexVoiceOver.log("pbEndScene fired")
         PokedexVoiceOver.stop
+        PokedexVoiceOver.prefetch_stop rescue nil
         dex_vo_orig_pbEndScene(*args)
       end
     else
