@@ -106,6 +106,15 @@ module PokedexVoiceOver
   # cry to finish before the Pokédex entry is read aloud.
   CRY_DELAY = 1.0
 
+  # Plausible duration band (seconds) for a SINGLE TTS sentence WAV.  A clip
+  # outside this band is treated as corrupt - typically a stale partial/garbage
+  # file left in the cache from before atomic-write + server-side verify
+  # shipped.  Such a file is deleted and regenerated, and the streaming timer
+  # never trusts its bogus (often near-zero) length, so it can no longer play
+  # back as a robotic/shrill stutter with the next sentence layered on top.
+  TTS_MIN_SENTENCE_SECS = 0.30
+  TTS_MAX_SENTENCE_SECS = 25.0
+
   # Sub-folder name (inside Audio/SE/Pokedex/) for TTS-generated cache
   # files (Fish-Speech or Piper).  Each unique entry text gets its own
   # deterministic filename so re-visits are instant.
@@ -408,6 +417,43 @@ module PokedexVoiceOver
     end
   end
 
+  # Parse a WAV's TRUE duration (seconds) from its canonical 44-byte header,
+  # returning nil - NOT a fallback - when the header is missing/garbage or the
+  # declared data-chunk size is implausible relative to the real file size.
+  # Used to (a) validate cache files before trusting them and (b) time sentence
+  # streaming, so a corrupt clip can neither be served as a "hit" nor cause the
+  # following sentence to start playing on top of it.
+  def self._tts_wav_real_duration(wav_path)
+    File.open(wav_path, "rb") do |f|
+      header = f.read(44)
+      return nil unless header && header.length >= 44
+      return nil unless header[0, 4] == "RIFF" && header[8, 4] == "WAVE"
+      byte_rate = header[28, 4].unpack("V")[0]
+      data_size = header[40, 4].unpack("V")[0]
+      return nil if byte_rate.nil? || byte_rate <= 0
+      return nil if data_size.nil? || data_size <= 0
+      # Cross-check the declared data size against the real file size.  A
+      # truncated or over-declared file (the classic concurrent-write
+      # corruption) is rejected here; a tiny slack absorbs trailing padding.
+      actual = (File.size(wav_path) rescue 0)
+      return nil if actual <= 44
+      return nil if data_size > (actual - 44) + 64
+      data_size.to_f / byte_rate
+    end
+  rescue => e
+    log("  _tts_wav_real_duration error: #{e.message}")
+    nil
+  end
+
+  # True when a cached sentence WAV is structurally sound AND its length sits in
+  # the plausible band for one spoken sentence.  The caller deletes a failing
+  # file so the verified server regenerates it cleanly (self-healing cache).
+  def self._tts_cache_healthy?(wav_path)
+    d = _tts_wav_real_duration(wav_path)
+    return false if d.nil?
+    d >= TTS_MIN_SENTENCE_SECS && d <= TTS_MAX_SENTENCE_SECS
+  end
+
   # -------------------------------------------------------------------------
   # Fish-Speech HTTP client - primary TTS backend
   # -------------------------------------------------------------------------
@@ -698,10 +744,19 @@ module PokedexVoiceOver
     cache_bare = _tts_cache_path(text)
     cache_wav  = "Audio/SE/#{cache_bare}.wav"
 
-    # Cache hit - skip the HTTP round-trip entirely
+    # Cache hit - but only trust a STRUCTURALLY SOUND file.  A corrupt or
+    # implausible-length WAV (stale corruption from before atomic-write +
+    # verify) is deleted here so it regenerates cleanly instead of playing
+    # back as a robotic/shrill stutter with a bogus near-zero duration that
+    # makes the next sentence start on top of it.
     if FileTest.exist?(cache_wav)
-      log("  _generate_tts_fish_speech: cache hit => #{cache_bare}")
-      return cache_bare
+      if _tts_cache_healthy?(cache_wav)
+        log("  _generate_tts_fish_speech: cache hit => #{cache_bare}")
+        return cache_bare
+      else
+        log("  _generate_tts_fish_speech: cache CORRUPT, regenerating => #{cache_bare}")
+        File.delete(cache_wav) rescue nil
+      end
     end
 
     begin
@@ -728,7 +783,7 @@ module PokedexVoiceOver
       # Another generation of the SAME sentence may have finished while we were
       # waiting (rapid navigation + idle prefetch can request the same text).
       # If the cache file now exists, keep it and drop ours - never overwrite.
-      if FileTest.exist?(cache_wav)
+      if FileTest.exist?(cache_wav) && _tts_cache_healthy?(cache_wav)
         log("  _generate_tts_fish_speech: cache filled concurrently => #{cache_bare}")
         return cache_bare
       end
@@ -742,9 +797,10 @@ module PokedexVoiceOver
       tmp_wav = "#{cache_wav}.#{Process.pid}.#{Thread.current.object_id.to_s(36)}.#{rand(1_000_000)}.tmp"
       begin
         File.open(tmp_wav, "wb") { |f| f.write(body) }
-        if FileTest.exist?(cache_wav)
-          File.delete(tmp_wav) rescue nil   # someone else won the race - keep theirs
+        if FileTest.exist?(cache_wav) && _tts_cache_healthy?(cache_wav)
+          File.delete(tmp_wav) rescue nil   # someone else won the race with a GOOD file - keep theirs
         else
+          File.delete(cache_wav) rescue nil # drop a corrupt/leftover file, if any, then install ours
           File.rename(tmp_wav, cache_wav)
         end
       rescue => e
@@ -2138,12 +2194,32 @@ module PokedexVoiceOver
                 end
               end
 
+              # Clean handoff: stop the PREVIOUS sentence's SE before starting
+              # this one.  Within a single entry the sentences are sequential,
+              # so even if a duration is mis-read too short the next sentence
+              # can never end up layered on top of the previous one (the
+              # "second sentence on top of the stutter" symptom).  Cross-entry
+              # interruption remains the generation counter's job; this only
+              # sequences sentences WITHIN the current, still-current entry.
+              if i > 0
+                begin; Audio.se_stop; rescue StandardError; end
+              end
+
               # Play this sentence and wait for it to finish.
               _play_bare(bare)
               wav_abs = "Audio/SE/#{bare}.wav"
-              dur = FileTest.exist?(wav_abs) ?
-                      PokedexVoiceOver._tts_audio_duration(wav_abs) :
-                      PokedexVoiceOver::SEQUENTIAL_DURATION_FALLBACK
+              real_dur = FileTest.exist?(wav_abs) ?
+                           PokedexVoiceOver._tts_wav_real_duration(wav_abs) : nil
+              # nil / implausibly-short means a bad clip slipped through; fall
+              # back to a text-length estimate so we never under-sleep into the
+              # next sentence.  ~0.06 s/char + 0.6 s lead, capped at the global
+              # sequential fallback.
+              dur = if real_dur && real_dur >= PokedexVoiceOver::TTS_MIN_SENTENCE_SECS
+                      real_dur
+                    else
+                      est = (sentences[i].to_s.length * 0.06) + 0.6
+                      [est, PokedexVoiceOver::SEQUENTIAL_DURATION_FALLBACK].min
+                    end
               PokedexVoiceOver.log("  Streaming TTS: sentence #{i + 1}/#{sentences.length} playing (#{dur.round(2)}s)")
 
               _interruptible_sleep(dur, my_gen)
