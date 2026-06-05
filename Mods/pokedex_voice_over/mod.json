@@ -3,7 +3,7 @@
   "id": "pokedex_voice_over",
   "version": "2.0.1",
   "author": "SilvertongueRED",
-  "description": "Reads every Pokédex entry aloud in the style of Dexter, the classic anime narrator. Ships an offline Fish-Speech voice-clone sidecar with a bundled portable Python 3.12 — no admin, no PATH changes, no SmartScreen prompts. First launch installs torch + fish-speech and downloads the ~1.4 GB voice-clone model from Hugging Face which will take several minutes on first-launch with the mod; everything after that runs fully offline with zero network calls, no API keys, and much more quickly.",
+  "description": "Hear your Pokédex come alive. 🎙️ Reads every entry aloud in the voice of Dexter, the iconic anime narrator. Offline Fish-Speech voice-clone runs locally — no API keys, no mic permissions, no web calls after first setup. No admin rights needed.",
   "tags": ["Audio", "QoL", "Fusion", "TTS"],
   "scripts": ["main.rb"],
   "settings": [
