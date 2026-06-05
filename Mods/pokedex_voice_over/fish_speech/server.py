@@ -100,6 +100,14 @@ except Exception:
 # when the game crashes and the at_exit shutdown hook never fires.
 DEFAULT_IDLE_TIMEOUT = 300  # 5 minutes (parent-PID monitor is the primary safety net)
 
+# Verify-then-commit degeneracy thresholds.  A healthy generation of the short
+# verify phrase is a brief, clearly NON-silent clip.  A quantized or mis-compiled
+# engine that "runs" but emits silence (or runs away to the token cap) is rejected
+# in _verify_generation so the server falls back to plain fp16 instead of silently
+# shipping junk audio.
+_VERIFY_MIN_PEAK = 0.02            # peak amplitude in 0..1; real speech is ~0.2-1.0
+_VERIFY_MAX_PLAUSIBLE_SECS = 20.0  # the verify phrase is short; >20 s = runaway
+
 # The fish-speech 1.5 engine source is VENDORED inside the mod at <here>/vendor
 # (a trimmed, pinned copy - see setup.py and requirements-runtime.txt).  Put it
 # FIRST on sys.path so "import fish_speech" always resolves to this offline copy,
@@ -638,19 +646,51 @@ def _verify_generation(engine, ref_audio_bytes, ref_text, compiled: bool = False
         log.info("Verifying generation%s (the first compiled run also JIT-compiles)...",
                  " [compiled]" if compiled else "")
         t0 = time.time()
+        import numpy as np
         got_audio = False
+        total_samples = 0
+        sample_rate = None
+        peak = 0.0
         for result in engine.inference(req):
             code = getattr(result, "code", None)
             if code == "error":
                 return False, f"engine error: {getattr(result, 'error', 'unknown')}"
             if code in ("final", "segment") and getattr(result, "audio", None) is not None:
-                _sr, samples = result.audio
+                sr, samples = result.audio
                 if samples is not None and len(samples) > 0:
                     got_audio = True
+                    if sample_rate is None:
+                        sample_rate = sr
+                    total_samples += len(samples)
+                    # Peak-amplitude check (best-effort: a measurement failure must
+                    # never FAIL the verify, so on error we treat it as loud=OK).
+                    try:
+                        arr = np.asarray(samples)
+                        if arr.dtype.kind in "iu":
+                            maxv = float(np.iinfo(arr.dtype).max) or 1.0
+                            p = float(np.abs(arr).max()) / maxv
+                        else:
+                            p = float(np.abs(arr).max())
+                        if p > peak:
+                            peak = p
+                    except Exception:
+                        peak = max(peak, 1.0)
         if not got_audio:
             return False, "engine produced no audio"
-        log.info("Verification generation OK in %.1fs%s",
-                 time.time() - t0, " [compiled]" if compiled else "")
+
+        # Degenerate-output guards so verify-then-commit rejects a quantized or
+        # mis-compiled engine that "generates" but produces UNUSABLE audio
+        # (the server then falls back to plain fp16 - never ships silence):
+        #   * runaway      -> far longer than the short verify phrase can be
+        #   * near-silent  -> peak amplitude essentially zero
+        dur = (total_samples / float(sample_rate)) if (sample_rate and sample_rate > 0) else 0.0
+        if dur > _VERIFY_MAX_PLAUSIBLE_SECS:
+            return False, (f"degenerate audio: {dur:.1f}s for a short phrase "
+                           f"(runaway generation)")
+        if peak < _VERIFY_MIN_PEAK:
+            return False, f"degenerate audio: near-silent (peak={peak:.4f})"
+        log.info("Verification generation OK in %.1fs%s (peak=%.3f, %.1fs audio)",
+                 time.time() - t0, " [compiled]" if compiled else "", peak, dur)
         return True, None
     except Exception as exc:
         log.exception("Verification generation raised")

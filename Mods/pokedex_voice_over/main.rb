@@ -665,6 +665,29 @@ module PokedexVoiceOver
     merged.reject(&:empty?)
   end
 
+  # Counts how many TTS generations (live playback OR idle prefetch) are
+  # currently hitting the single-queue Fish-Speech server.  The idle prefetch
+  # checks tts_busy? and yields whenever a LIVE request is generating, so it
+  # never queues a long job ahead of the entry the player is actually looking
+  # at (which was making the first sentence wait, and - with slow int8 - time
+  # out into silence).
+  @tts_inflight = 0
+  @tts_inflight_mutex = (defined?(Mutex) ? Mutex.new : nil)
+
+  def self._tts_inflight_inc
+    if @tts_inflight_mutex then @tts_inflight_mutex.synchronize { @tts_inflight += 1 }
+    else @tts_inflight += 1 end
+  end
+
+  def self._tts_inflight_dec
+    if @tts_inflight_mutex then @tts_inflight_mutex.synchronize { @tts_inflight -= 1 if @tts_inflight > 0 }
+    else (@tts_inflight -= 1 if @tts_inflight > 0) end
+  end
+
+  def self.tts_busy?
+    @tts_inflight > 0
+  end
+
   # Generate a WAV via Fish-Speech for *text* and return the bare audio path
   # (relative to Audio/SE/, without extension) on success, or nil on failure.
   # Files are cached by content hash so repeat visits are instant.
@@ -690,28 +713,57 @@ module PokedexVoiceOver
 
     log("  _generate_tts_fish_speech: requesting (#{text.length} chars)...")
     started = Time.now.to_f
-
-    body = _tcp_post(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/tts",
-                     "text=#{_url_encode(text)}",
-                     timeout: FISH_SPEECH_TIMEOUT)
-
-    unless body && body.length > 44
-      log("  _generate_tts_fish_speech: bad/empty response")
-      _fish_speech_invalidate
-      return nil
-    end
-
-    # Write the WAV bytes to the cache file (binary mode!).
+    _tts_inflight_inc
     begin
-      File.open(cache_wav, "wb") { |f| f.write(body) }
-    rescue => e
-      log("  _generate_tts_fish_speech: failed to write WAV: #{e.message}")
-      return nil
-    end
+      body = _tcp_post(FISH_SPEECH_HOST, FISH_SPEECH_PORT, "/tts",
+                       "text=#{_url_encode(text)}",
+                       timeout: FISH_SPEECH_TIMEOUT)
 
-    elapsed = Time.now.to_f - started
-    log("  _generate_tts_fish_speech: success in #{elapsed.round(2)}s => #{cache_bare}")
-    cache_bare
+      unless body && body.length > 44
+        log("  _generate_tts_fish_speech: bad/empty response")
+        _fish_speech_invalidate
+        return nil
+      end
+
+      # Another generation of the SAME sentence may have finished while we were
+      # waiting (rapid navigation + idle prefetch can request the same text).
+      # If the cache file now exists, keep it and drop ours - never overwrite.
+      if FileTest.exist?(cache_wav)
+        log("  _generate_tts_fish_speech: cache filled concurrently => #{cache_bare}")
+        return cache_bare
+      end
+
+      # ATOMIC WRITE: write to a unique temp file, then rename it into place.
+      # A plain File.open(cache_wav,"wb") TRUNCATES the file the instant it
+      # opens, so if the player (or another generating thread) reads cache_wav
+      # mid-write it gets a corrupt, wrong-length WAV - the "35 s of silence"
+      # bug seen when slow int8 widened the overlap window.  Writing a temp
+      # file and renaming means readers only ever see a COMPLETE file.
+      tmp_wav = "#{cache_wav}.#{Process.pid}.#{Thread.current.object_id.to_s(36)}.#{rand(1_000_000)}.tmp"
+      begin
+        File.open(tmp_wav, "wb") { |f| f.write(body) }
+        if FileTest.exist?(cache_wav)
+          File.delete(tmp_wav) rescue nil   # someone else won the race - keep theirs
+        else
+          File.rename(tmp_wav, cache_wav)
+        end
+      rescue => e
+        log("  _generate_tts_fish_speech: atomic write failed (#{e.message}) - falling back")
+        File.delete(tmp_wav) rescue nil
+        begin
+          File.open(cache_wav, "wb") { |f| f.write(body) } unless FileTest.exist?(cache_wav)
+        rescue => e2
+          log("  _generate_tts_fish_speech: fallback write failed: #{e2.message}")
+          return nil
+        end
+      end
+
+      elapsed = Time.now.to_f - started
+      log("  _generate_tts_fish_speech: success in #{elapsed.round(2)}s => #{cache_bare}")
+      cache_bare
+    ensure
+      _tts_inflight_dec
+    end
   end
 
   # =========================================================================
@@ -793,6 +845,7 @@ module PokedexVoiceOver
       end
       next if (Time.now.to_f - idle_since) < PREFETCH_IDLE_DELAY
       next unless _prefetch_server_ready?
+      next if tts_busy?   # a live entry is generating - yield, don't queue behind it
       target = _prefetch_next_target(list, idx)
       next unless target
       _prefetch_one_species(target)
