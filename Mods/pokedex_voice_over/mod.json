@@ -3,7 +3,7 @@
   "id": "pokedex_voice_over",
   "version": "2.0.1",
   "author": "SilvertongueRED",
-  "description": "Hear your Pokédex come alive. 🎙️ Reads every entry aloud in the voice of Dexter, the iconic anime narrator. Offline Fish-Speech voice-clone runs locally — no API keys, no mic permissions, no web calls after first setup. No admin rights needed.",
+  "description": "Hear your Pokédex come alive! Reads every entry aloud in the voice of Dexter, the iconic anime narrator. Using an offline Fish-Speech voice-clone — no internet needed after first setup. TTS server runs in a terminal in the background, and after first setup, startup of the mod is quick! Settings can be adjusted via the Mod Settings mod!",
   "tags": ["Audio", "QoL", "Fusion", "TTS"],
   "scripts": ["main.rb"],
   "settings": [
